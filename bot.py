@@ -471,6 +471,7 @@ def main() -> None:
         level=os.environ.get("LOG_LEVEL", "INFO").upper(),
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
+    logging.getLogger("httpx").setLevel(logging.WARNING)
     config = Config.from_env()
     store = SignalStore(config.database_path)
     application = (
