@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 import math
 import os
 import sqlite3
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
@@ -15,7 +17,11 @@ from telegram.ext import Application, ApplicationBuilder, CommandHandler, Contex
 from strategy import Candle, Signal, build_signal
 
 BYBIT_KLINE_URL = "https://api.bybit.com/v5/market/kline"
+BYBIT_INSTRUMENTS_URL = "https://api.bybit.com/v5/market/instruments-info"
 VALID_INTERVALS = {"1", "3", "5", "15", "30", "60", "120", "240", "360", "720", "D", "W", "M"}
+SYMBOL_CACHE_SECONDS = 60 * 60
+MAX_CONCURRENT_SYMBOL_SCANS = 8
+BYBIT_REQUEST_INTERVAL_SECONDS = 0.12
 LOG = logging.getLogger("bybit_signals")
 
 
@@ -23,6 +29,7 @@ LOG = logging.getLogger("bybit_signals")
 class Config:
     telegram_bot_token: str
     symbols: tuple[str, ...]
+    all_usdt_perpetuals: bool
     interval: str
     scan_interval_seconds: int
     database_path: str
@@ -40,15 +47,19 @@ class Config:
         if not token:
             raise ValueError("TELEGRAM_BOT_TOKEN is required")
 
-        symbols = tuple(
+        symbol_setting = os.environ.get("SYMBOLS", "ALL").strip()
+        all_usdt_perpetuals = symbol_setting.upper() == "ALL"
+        symbols = () if all_usdt_perpetuals else tuple(
             dict.fromkeys(
                 symbol.strip().upper()
-                for symbol in os.environ.get("SYMBOLS", "BTCUSDT,ETHUSDT,SOLUSDT").split(",")
+                for symbol in symbol_setting.split(",")
                 if symbol.strip()
             )
         )
-        if not symbols or any(not symbol.endswith("USDT") for symbol in symbols):
-            raise ValueError("SYMBOLS must contain one or more USDT symbols, e.g. BTCUSDT,ETHUSDT")
+        if not all_usdt_perpetuals and (
+            not symbols or any(not symbol.endswith("USDT") for symbol in symbols)
+        ):
+            raise ValueError("SYMBOLS must be ALL or a comma-separated list of USDT symbols")
 
         interval = os.environ.get("INTERVAL", "15").strip().upper()
         if interval not in VALID_INTERVALS:
@@ -88,6 +99,7 @@ class Config:
         return cls(
             telegram_bot_token=token,
             symbols=symbols,
+            all_usdt_perpetuals=all_usdt_perpetuals,
             interval=interval,
             scan_interval_seconds=scan_interval,
             database_path=os.environ.get("DATABASE_PATH", "signals.sqlite3"),
@@ -158,20 +170,59 @@ class SignalStore:
 class BybitClient:
     def __init__(self, client: httpx.AsyncClient) -> None:
         self.client = client
+        self._request_lock: asyncio.Lock | None = None
+        self._last_request_at = 0.0
+
+    async def get_active_usdt_perpetual_symbols(self) -> tuple[str, ...]:
+        symbols = set()
+        cursor = None
+        seen_cursors = set()
+
+        while True:
+            params = {"category": "linear", "limit": 1000}
+            if cursor:
+                params["cursor"] = cursor
+            payload = await self._get_payload(BYBIT_INSTRUMENTS_URL, params)
+            result = payload.get("result")
+            if not isinstance(result, dict) or not isinstance(result.get("list"), list):
+                raise RuntimeError("Bybit returned malformed instruments data")
+
+            for instrument in result["list"]:
+                if not isinstance(instrument, dict):
+                    raise RuntimeError("Bybit returned malformed instrument data")
+                symbol = instrument.get("symbol")
+                if (
+                    instrument.get("status") == "Trading"
+                    and instrument.get("contractType") == "LinearPerpetual"
+                    and instrument.get("settleCoin") == "USDT"
+                    and isinstance(symbol, str)
+                    and symbol.endswith("USDT")
+                ):
+                    symbols.add(symbol)
+
+            next_cursor = result.get("nextPageCursor")
+            if not next_cursor:
+                break
+            if not isinstance(next_cursor, str):
+                raise RuntimeError("Bybit returned an invalid instruments cursor")
+            if next_cursor in seen_cursors:
+                raise RuntimeError("Bybit returned a repeated instruments cursor")
+            seen_cursors.add(next_cursor)
+            cursor = next_cursor
+
+        if not symbols:
+            raise RuntimeError("Bybit returned no active USDT perpetual contracts")
+        return tuple(sorted(symbols))
 
     async def get_closed_candles(self, symbol: str, interval: str) -> list[Candle]:
-        response = await self.client.get(
+        payload = await self._get_payload(
             BYBIT_KLINE_URL,
-            params={"category": "linear", "symbol": symbol, "interval": interval, "limit": 200},
+            {"category": "linear", "symbol": symbol, "interval": interval, "limit": 200},
         )
-        response.raise_for_status()
-        payload = response.json()
-        if payload.get("retCode") != 0:
-            raise RuntimeError(
-                f"Bybit returned retCode={payload.get('retCode')}: {payload.get('retMsg')}"
-            )
-
-        rows = payload.get("result", {}).get("list", [])
+        result = payload.get("result")
+        if not isinstance(result, dict) or not isinstance(result.get("list"), list):
+            raise RuntimeError(f"Bybit returned malformed kline data for {symbol}")
+        rows = result["list"]
         if len(rows) < 3:
             return []
 
@@ -190,6 +241,25 @@ class BybitClient:
             ]
         except (IndexError, TypeError, ValueError) as error:
             raise RuntimeError(f"Bybit returned malformed kline data for {symbol}") from error
+
+    async def _get_payload(self, url: str, params: dict[str, str | int]) -> dict:
+        if self._request_lock is None:
+            self._request_lock = asyncio.Lock()
+        async with self._request_lock:
+            now = asyncio.get_running_loop().time()
+            delay = BYBIT_REQUEST_INTERVAL_SECONDS - (now - self._last_request_at)
+            if delay > 0:
+                await asyncio.sleep(delay)
+            self._last_request_at = asyncio.get_running_loop().time()
+
+        response = await self.client.get(url, params=params)
+        response.raise_for_status()
+        payload = response.json()
+        if not isinstance(payload, dict) or payload.get("retCode") != 0:
+            code = payload.get("retCode") if isinstance(payload, dict) else "unknown"
+            message = payload.get("retMsg") if isinstance(payload, dict) else "invalid response"
+            raise RuntimeError(f"Bybit returned retCode={code}: {message}")
+        return payload
 
 
 def format_signal(signal: Signal, config: Config) -> str:
@@ -256,9 +326,17 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     config: Config = context.application.bot_data["config"]
     last_scan = context.application.bot_data.get("last_scan_at", "проверка еще не выполнялась")
+    active_symbols = context.application.bot_data.get("active_symbols", ())
+    markets = (
+        f"Все активные USDT perpetual Bybit ({len(active_symbols)} рынков)"
+        if config.all_usdt_perpetuals and active_symbols
+        else "Все активные USDT perpetual Bybit (список загружается)"
+        if config.all_usdt_perpetuals
+        else f"{len(config.symbols)} рынков: {', '.join(config.symbols)}"
+    )
     await update.message.reply_text(
         f"Режим: сигналы без торговли\n"
-        f"Рынки: {', '.join(config.symbols)}\n"
+        f"Рынки: {markets}\n"
         f"Таймфрейм: {config.interval}\n"
         f"Стратегия: EMA {config.fast_ema_period}/{config.slow_ema_period}, "
         f"RSI {config.rsi_period}, ATR {config.atr_period} x{config.atr_multiplier:g}\n"
@@ -272,6 +350,21 @@ async def symbols(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.message is None:
         return
     config: Config = context.application.bot_data["config"]
+    active_symbols = context.application.bot_data.get("active_symbols", ())
+    if config.all_usdt_perpetuals:
+        if not active_symbols:
+            await update.message.reply_text(
+                "Список активных USDT perpetual-контрактов Bybit загрузится при первом сканировании."
+            )
+            return
+        symbols_preview = ", ".join(active_symbols[:30])
+        extra_count = len(active_symbols) - min(30, len(active_symbols))
+        suffix = f" и еще {extra_count}" if extra_count else ""
+        await update.message.reply_text(
+            f"Отслеживаю {len(active_symbols)} активных USDT perpetual-контрактов.\n"
+            f"Примеры: {symbols_preview}{suffix}\nТаймфрейм: {config.interval}"
+        )
+        return
     await update.message.reply_text(
         f"Отслеживаемые рынки: {', '.join(config.symbols)}\nТаймфрейм: {config.interval}"
     )
@@ -285,16 +378,36 @@ async def scan_market(context: ContextTypes.DEFAULT_TYPE) -> None:
         "%Y-%m-%d %H:%M:%S UTC"
     )
 
-    for symbol in config.symbols:
+    if config.all_usdt_perpetuals:
         try:
-            candles = await client.get_closed_candles(symbol, config.interval)
+            refreshed_at = context.application.bot_data.get("symbols_refreshed_at", 0.0)
+            now = time.monotonic()
+            if now - refreshed_at >= SYMBOL_CACHE_SECONDS:
+                active_symbols = await client.get_active_usdt_perpetual_symbols()
+                context.application.bot_data["active_symbols"] = active_symbols
+                context.application.bot_data["symbols_refreshed_at"] = now
+                LOG.info("Loaded %d active USDT perpetual symbols from Bybit", len(active_symbols))
+            scan_symbols = context.application.bot_data["active_symbols"]
+        except (httpx.HTTPError, RuntimeError, ValueError, KeyError):
+            LOG.exception("Failed to load active USDT perpetual symbols")
+            return
+    else:
+        scan_symbols = config.symbols
+
+    subscribers = store.subscribers()
+    semaphore = asyncio.Semaphore(MAX_CONCURRENT_SYMBOL_SCANS)
+
+    async def scan_symbol(symbol: str) -> None:
+        try:
+            async with semaphore:
+                candles = await client.get_closed_candles(symbol, config.interval)
             if not candles:
                 LOG.warning("Not enough closed candles for %s", symbol)
-                continue
+                return
             latest = candles[-1]
             last_processed = store.last_processed(symbol, config.interval)
             if last_processed is not None and latest.timestamp <= last_processed:
-                continue
+                return
 
             signal = build_signal(
                 symbol,
@@ -309,7 +422,7 @@ async def scan_market(context: ContextTypes.DEFAULT_TYPE) -> None:
             )
             if signal:
                 message = format_signal(signal, config)
-                for chat_id in store.subscribers():
+                for chat_id in subscribers:
                     try:
                         await context.bot.send_message(chat_id=chat_id, text=message)
                     except TelegramError:
@@ -317,6 +430,8 @@ async def scan_market(context: ContextTypes.DEFAULT_TYPE) -> None:
             store.mark_processed(symbol, config.interval, latest.timestamp)
         except (httpx.HTTPError, RuntimeError, ValueError):
             LOG.exception("Failed to scan %s", symbol)
+
+    await asyncio.gather(*(scan_symbol(symbol) for symbol in scan_symbols))
 
 
 async def post_init(application: Application) -> None:
@@ -328,6 +443,7 @@ async def post_init(application: Application) -> None:
         interval=config.scan_interval_seconds,
         first=5,
         name="bybit-market-scan",
+        job_kwargs={"max_instances": 1, "coalesce": True},
     )
 
 
@@ -359,7 +475,8 @@ def main() -> None:
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("status", status))
     application.add_handler(CommandHandler("symbols", symbols))
-    LOG.info("Starting signal-only bot for %s at interval %s", config.symbols, config.interval)
+    markets = "all active USDT perpetuals" if config.all_usdt_perpetuals else config.symbols
+    LOG.info("Starting signal-only bot for %s at interval %s", markets, config.interval)
     application.run_polling()
 
 

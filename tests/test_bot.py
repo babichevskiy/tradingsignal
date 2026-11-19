@@ -14,9 +14,21 @@ class ConfigTests(unittest.TestCase):
         with patch.dict(os.environ, {"TELEGRAM_BOT_TOKEN": "test-token"}, clear=True):
             config = Config.from_env()
 
-        self.assertEqual(config.symbols, ("BTCUSDT", "ETHUSDT", "SOLUSDT"))
+        self.assertTrue(config.all_usdt_perpetuals)
+        self.assertEqual(config.symbols, ())
         self.assertEqual(config.interval, "15")
         self.assertEqual((config.fast_ema_period, config.slow_ema_period), (20, 50))
+
+    def test_explicit_symbols_override_all_markets(self):
+        with patch.dict(
+            os.environ,
+            {"TELEGRAM_BOT_TOKEN": "test-token", "SYMBOLS": "BTCUSDT,ETHUSDT,BTCUSDT"},
+            clear=True,
+        ):
+            config = Config.from_env()
+
+        self.assertFalse(config.all_usdt_perpetuals)
+        self.assertEqual(config.symbols, ("BTCUSDT", "ETHUSDT"))
 
     def test_invalid_ema_order_is_rejected(self):
         with patch.dict(
@@ -40,6 +52,42 @@ class ConfigTests(unittest.TestCase):
 
 
 class BybitClientTests(unittest.TestCase):
+    def test_discovers_only_trading_usdt_perpetuals_across_pages(self):
+        pages = {
+            None: {
+                "list": [
+                    {"symbol": "BTCUSDT", "status": "Trading", "contractType": "LinearPerpetual", "settleCoin": "USDT"},
+                    {"symbol": "BTCUSDC", "status": "Trading", "contractType": "LinearPerpetual", "settleCoin": "USDC"},
+                    {"symbol": "PENDINGUSDT", "status": "PendingOpen", "contractType": "LinearPerpetual", "settleCoin": "USDT"},
+                ],
+                "nextPageCursor": "next",
+            },
+            "next": {
+                "list": [
+                    {"symbol": "ETHUSDT", "status": "Trading", "contractType": "LinearPerpetual", "settleCoin": "USDT"},
+                    {"symbol": "BTCUSDT", "status": "Trading", "contractType": "LinearPerpetual", "settleCoin": "USDT"},
+                    {"symbol": "FUTUREUSDT", "status": "Trading", "contractType": "LinearFutures", "settleCoin": "USDT"},
+                ],
+                "nextPageCursor": "",
+            },
+        }
+
+        class FakeClient:
+            async def get(self, url, params):
+                cursor = params.get("cursor")
+                result = pages[cursor]
+                return httpx.Response(
+                    200,
+                    request=httpx.Request("GET", url),
+                    json={"retCode": 0, "result": result},
+                )
+
+        async def discover():
+            with patch("bot.BYBIT_REQUEST_INTERVAL_SECONDS", 0):
+                return await BybitClient(FakeClient()).get_active_usdt_perpetual_symbols()
+
+        self.assertEqual(asyncio.run(discover()), ("BTCUSDT", "ETHUSDT"))
+
     def test_discards_unclosed_candle_and_returns_chronological_data(self):
         rows = [
             [str(timestamp), "10", "12", "9", "11", "100", "1100"]
