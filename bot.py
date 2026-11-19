@@ -370,6 +370,25 @@ async def symbols(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
+async def get_scan_symbols(
+    context: ContextTypes.DEFAULT_TYPE,
+    config: Config,
+    client: BybitClient,
+) -> tuple[str, ...]:
+    if not config.all_usdt_perpetuals:
+        return config.symbols
+
+    bot_data = context.application.bot_data
+    active_symbols = bot_data.get("active_symbols")
+    refreshed_at = bot_data.get("symbols_refreshed_at", 0.0)
+    if not active_symbols or time.monotonic() - refreshed_at >= SYMBOL_CACHE_SECONDS:
+        active_symbols = await client.get_active_usdt_perpetual_symbols()
+        bot_data["active_symbols"] = active_symbols
+        bot_data["symbols_refreshed_at"] = time.monotonic()
+        LOG.info("Loaded %d active USDT perpetual symbols from Bybit", len(active_symbols))
+    return active_symbols
+
+
 async def scan_market(context: ContextTypes.DEFAULT_TYPE) -> None:
     config: Config = context.application.bot_data["config"]
     store: SignalStore = context.application.bot_data["store"]
@@ -380,14 +399,7 @@ async def scan_market(context: ContextTypes.DEFAULT_TYPE) -> None:
 
     if config.all_usdt_perpetuals:
         try:
-            refreshed_at = context.application.bot_data.get("symbols_refreshed_at", 0.0)
-            now = time.monotonic()
-            if now - refreshed_at >= SYMBOL_CACHE_SECONDS:
-                active_symbols = await client.get_active_usdt_perpetual_symbols()
-                context.application.bot_data["active_symbols"] = active_symbols
-                context.application.bot_data["symbols_refreshed_at"] = now
-                LOG.info("Loaded %d active USDT perpetual symbols from Bybit", len(active_symbols))
-            scan_symbols = context.application.bot_data["active_symbols"]
+            scan_symbols = await get_scan_symbols(context, config, client)
         except (httpx.HTTPError, RuntimeError, ValueError, KeyError):
             LOG.exception("Failed to load active USDT perpetual symbols")
             return

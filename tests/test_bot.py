@@ -1,11 +1,13 @@
 import asyncio
 import os
+import time
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import httpx
 
-from bot import BybitClient, Config, format_signal
+from bot import BybitClient, Config, format_signal, get_scan_symbols
 from strategy import Signal
 
 
@@ -87,6 +89,25 @@ class BybitClientTests(unittest.TestCase):
                 return await BybitClient(FakeClient()).get_active_usdt_perpetual_symbols()
 
         self.assertEqual(asyncio.run(discover()), ("BTCUSDT", "ETHUSDT"))
+
+    def test_missing_symbol_cache_is_refreshed_even_if_timestamp_is_recent(self):
+        with patch.dict(os.environ, {"TELEGRAM_BOT_TOKEN": "test-token"}, clear=True):
+            config = Config.from_env()
+
+        class FakeBybitClient:
+            async def get_active_usdt_perpetual_symbols(self):
+                return ("BTCUSDT", "ETHUSDT")
+
+        context = SimpleNamespace(
+            application=SimpleNamespace(
+                bot_data={"symbols_refreshed_at": time.monotonic() - 10}
+            )
+        )
+
+        symbols = asyncio.run(get_scan_symbols(context, config, FakeBybitClient()))
+
+        self.assertEqual(symbols, ("BTCUSDT", "ETHUSDT"))
+        self.assertEqual(context.application.bot_data["active_symbols"], symbols)
 
     def test_discards_unclosed_candle_and_returns_chronological_data(self):
         rows = [
