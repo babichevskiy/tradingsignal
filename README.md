@@ -34,7 +34,7 @@ python bot.py
 | `TELEGRAM_BOT_TOKEN` | — | Обязательный токен Telegram-бота |
 | `SYMBOLS` | `ALL` | `ALL` отслеживает все активные USDT perpetual-символы; можно указать список, например `BTCUSDT,ETHUSDT` |
 | `INTERVAL` | `15` | Таймфрейм Bybit: `1`, `3`, `5`, `15`, `30`, `60`, `120`, `240`, `360`, `720`, `D`, `W` или `M` |
-| `SCAN_INTERVAL_SECONDS` | `60` | Интервал проверки рынка, минимум 30 секунд |
+| `SCAN_INTERVAL_SECONDS` | `300` при `SYMBOLS=ALL`, иначе `60` | Интервал проверки рынка, минимум 30 секунд |
 | `DATABASE_PATH` | `signals.sqlite3` | Файл SQLite с подписчиками и обработанными свечами |
 | `FAST_EMA_PERIOD` / `SLOW_EMA_PERIOD` | `20` / `50` | Периоды быстрой и медленной EMA; быстрая должна быть меньше медленной |
 | `RSI_PERIOD` / `ATR_PERIOD` | `14` / `14` | Периоды индикаторов RSI и ATR |

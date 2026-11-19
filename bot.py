@@ -22,6 +22,7 @@ VALID_INTERVALS = {"1", "3", "5", "15", "30", "60", "120", "240", "360", "720", 
 SYMBOL_CACHE_SECONDS = 60 * 60
 MAX_CONCURRENT_SYMBOL_SCANS = 8
 BYBIT_REQUEST_INTERVAL_SECONDS = 0.12
+BYBIT_HTTP_TIMEOUT_SECONDS = 30
 LOG = logging.getLogger("bybit_signals")
 
 
@@ -66,7 +67,10 @@ class Config:
             raise ValueError(f"INTERVAL must be one of: {', '.join(sorted(VALID_INTERVALS))}")
 
         try:
-            scan_interval = int(os.environ.get("SCAN_INTERVAL_SECONDS", "60"))
+            default_scan_interval = "300" if all_usdt_perpetuals else "60"
+            scan_interval = int(
+                os.environ.get("SCAN_INTERVAL_SECONDS", default_scan_interval)
+            )
         except ValueError as error:
             raise ValueError("SCAN_INTERVAL_SECONDS must be an integer") from error
         if scan_interval < 30:
@@ -245,16 +249,27 @@ class BybitClient:
     async def _get_payload(self, url: str, params: dict[str, str | int]) -> dict:
         if self._request_lock is None:
             self._request_lock = asyncio.Lock()
-        async with self._request_lock:
-            now = asyncio.get_running_loop().time()
-            delay = BYBIT_REQUEST_INTERVAL_SECONDS - (now - self._last_request_at)
-            if delay > 0:
-                await asyncio.sleep(delay)
-            self._last_request_at = asyncio.get_running_loop().time()
+        last_error: Exception | None = None
+        for attempt in range(3):
+            async with self._request_lock:
+                now = asyncio.get_running_loop().time()
+                delay = BYBIT_REQUEST_INTERVAL_SECONDS - (now - self._last_request_at)
+                if delay > 0:
+                    await asyncio.sleep(delay)
+                self._last_request_at = asyncio.get_running_loop().time()
 
-        response = await self.client.get(url, params=params)
-        response.raise_for_status()
-        payload = response.json()
+            try:
+                response = await self.client.get(url, params=params)
+                response.raise_for_status()
+                payload = response.json()
+                break
+            except httpx.TransportError as error:
+                last_error = error
+                if attempt == 2:
+                    raise
+                await asyncio.sleep(1 + attempt)
+        else:
+            raise RuntimeError("Bybit request failed") from last_error
         if not isinstance(payload, dict) or payload.get("retCode") != 0:
             code = payload.get("retCode") if isinstance(payload, dict) else "unknown"
             message = payload.get("retMsg") if isinstance(payload, dict) else "invalid response"
@@ -447,7 +462,9 @@ async def scan_market(context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def post_init(application: Application) -> None:
-    application.bot_data["http_client"] = httpx.AsyncClient(timeout=10)
+    application.bot_data["http_client"] = httpx.AsyncClient(
+        timeout=BYBIT_HTTP_TIMEOUT_SECONDS
+    )
     application.bot_data["bybit"] = BybitClient(application.bot_data["http_client"])
     config: Config = application.bot_data["config"]
     application.job_queue.run_repeating(

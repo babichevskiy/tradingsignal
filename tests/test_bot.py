@@ -19,6 +19,7 @@ class ConfigTests(unittest.TestCase):
         self.assertTrue(config.all_usdt_perpetuals)
         self.assertEqual(config.symbols, ())
         self.assertEqual(config.interval, "15")
+        self.assertEqual(config.scan_interval_seconds, 300)
         self.assertEqual((config.fast_ema_period, config.slow_ema_period), (20, 50))
 
     def test_explicit_symbols_override_all_markets(self):
