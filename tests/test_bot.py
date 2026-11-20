@@ -12,6 +12,7 @@ from bot import (
     Config,
     SignalStore,
     evaluate_price_alert,
+    format_rsi_extreme,
     format_signal,
     get_scan_symbols,
 )
@@ -59,6 +60,14 @@ class ConfigTests(unittest.TestCase):
         self.assertIn("Тейк 1: 103.00", message)
         self.assertIn("Стоп: 97.0000", message)
         self.assertIn("бот не торгует", message)
+
+    def test_overheat_alert_warns_without_promising_a_reversal(self):
+        message = format_rsi_extreme("BTCUSDT", "overbought", 72.5, 65000, 0, "15")
+
+        self.assertIn("ПЕРЕКУПЛЕННОСТЬ", message)
+        self.assertIn("RSI 72.5", message)
+        self.assertIn("Возможен откат вниз", message)
+        self.assertIn("разворот не гарантирован", message)
 
 
 class BybitClientTests(unittest.TestCase):
@@ -193,6 +202,18 @@ class WatchlistTests(unittest.TestCase):
         self.assertEqual(evaluate_price_alert(6.0, 5, "up"), (None, "up"))
         self.assertEqual(evaluate_price_alert(3.9, 5, "up"), (None, None))
         self.assertEqual(evaluate_price_alert(-5.2, 5, "up"), ("down", "down"))
+
+    def test_rsi_extreme_processing_state_is_persisted_per_symbol_and_interval(self):
+        store = SignalStore(":memory:")
+
+        self.assertIsNone(store.rsi_extreme_state("BTCUSDT", "15"))
+        store.mark_rsi_extreme_processed("BTCUSDT", "15", 123, "overbought")
+        self.assertEqual(
+            store.rsi_extreme_state("BTCUSDT", "15"), (123, "overbought")
+        )
+        self.assertIsNone(store.rsi_extreme_state("ETHUSDT", "15"))
+        self.assertIsNone(store.rsi_extreme_state("BTCUSDT", "60"))
+        store.close()
 
 
 if __name__ == "__main__":

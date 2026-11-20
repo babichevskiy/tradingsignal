@@ -56,6 +56,24 @@ def rsi(values: list[float], period: int = 14) -> list[float]:
     return result
 
 
+def detect_rsi_extreme(
+    values: list[float],
+    period: int = 14,
+    overbought: float = 70,
+    oversold: float = 30,
+) -> tuple[str, float] | None:
+    readings = rsi(values, period)
+    if not readings:
+        return None
+
+    current = readings[-1]
+    if current >= overbought:
+        return "overbought", current
+    if current <= oversold:
+        return "oversold", current
+    return None
+
+
 def atr(candles: list[Candle], period: int = 14) -> list[float]:
     if period <= 0:
         raise ValueError("period must be positive")

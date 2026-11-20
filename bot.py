@@ -14,7 +14,7 @@ from telegram import Update
 from telegram.error import TelegramError
 from telegram.ext import Application, ApplicationBuilder, CommandHandler, ContextTypes
 
-from strategy import Candle, Signal, build_signal
+from strategy import Candle, Signal, build_signal, detect_rsi_extreme
 
 BYBIT_KLINE_URL = "https://api.bybit.com/v5/market/kline"
 BYBIT_INSTRUMENTS_URL = "https://api.bybit.com/v5/market/instruments-info"
@@ -137,6 +137,13 @@ class SignalStore:
                 timestamp INTEGER NOT NULL,
                 PRIMARY KEY (symbol, interval)
             );
+            CREATE TABLE IF NOT EXISTS processed_rsi_extremes (
+                symbol TEXT NOT NULL,
+                interval TEXT NOT NULL,
+                timestamp INTEGER NOT NULL,
+                state TEXT NOT NULL,
+                PRIMARY KEY (symbol, interval)
+            );
             CREATE TABLE IF NOT EXISTS watchlist (
                 chat_id INTEGER NOT NULL,
                 symbol TEXT NOT NULL,
@@ -176,6 +183,31 @@ class SignalStore:
             ON CONFLICT(symbol, interval) DO UPDATE SET timestamp = excluded.timestamp
             """,
             (symbol, interval, timestamp),
+        )
+        self.connection.commit()
+
+    def rsi_extreme_state(self, symbol: str, interval: str) -> tuple[int, str] | None:
+        row = self.connection.execute(
+            """
+            SELECT timestamp, state FROM processed_rsi_extremes
+            WHERE symbol = ? AND interval = ?
+            """,
+            (symbol, interval),
+        ).fetchone()
+        return (row[0], row[1]) if row else None
+
+    def mark_rsi_extreme_processed(
+        self, symbol: str, interval: str, timestamp: int, state: str
+    ) -> None:
+        self.connection.execute(
+            """
+            INSERT INTO processed_rsi_extremes(symbol, interval, timestamp, state)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(symbol, interval) DO UPDATE SET
+                timestamp = excluded.timestamp,
+                state = excluded.state
+            """,
+            (symbol, interval, timestamp, state),
         )
         self.connection.commit()
 
@@ -383,6 +415,34 @@ def format_signal(signal: Signal, config: Config) -> str:
     )
 
 
+def format_rsi_extreme(
+    symbol: str,
+    state: str,
+    rsi_value: float,
+    close: float,
+    timestamp: int,
+    interval: str,
+) -> str:
+    opened_at = datetime.fromtimestamp(timestamp / 1000, tz=timezone.utc)
+    interval_label = {"D": "1д", "W": "1н", "M": "1м"}.get(interval, f"{interval}м")
+    if state == "overbought":
+        heading = "ПЕРЕКУПЛЕННОСТЬ"
+        note = "Возможен откат вниз, но разворот не гарантирован."
+        emoji = "🔥"
+    else:
+        heading = "ПЕРЕПРОДАННОСТЬ"
+        note = "Возможен отскок вверх, но разворот не гарантирован."
+        emoji = "🧊"
+    return (
+        f"{emoji} RSI-СИГНАЛ • {heading}\n"
+        f"#{symbol} · Bybit Perpetual · {interval_label}\n"
+        f"RSI {rsi_value:.1f} · Цена закрытия свечи: {format_price(close)} USDT\n"
+        f"Время свечи: {opened_at:%Y-%m-%d %H:%M UTC}\n\n"
+        f"{note}\n"
+        "Это индикаторное предупреждение, а не рекомендация открывать сделку."
+    )
+
+
 def format_price(price: float) -> str:
     return f"{price:.2f}" if price >= 100 else f"{price:.4f}" if price >= 1 else f"{price:.8f}".rstrip("0")
 
@@ -415,7 +475,9 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if update.message:
         await update.message.reply_text(
             "Я отслеживаю публичные USDT perpetual-контракты Bybit и сообщаю о пересечениях EMA "
-            "с подтверждением RSI. Уровни рассчитываются по ATR.\n"
+            "с подтверждением RSI. Также сообщаю о входе RSI в зоны перекупленности (≥70) "
+            "и перепроданности (≤30); это предупреждение о возможном откате/отскоке, "
+            "не гарантия разворота.\n"
             "Я не принимаю ордера и не использую ключи биржи.\n\n"
             "/start — подписаться\n/status — состояние бота\n/symbols — список рынков\n"
             "/watch BTCUSDT [5] — следить за монетой и задать порог изменения за 24 часа в %\n"
@@ -442,7 +504,8 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"Рынки: {markets}\n"
         f"Таймфрейм: {config.interval}\n"
         f"Стратегия: EMA {config.fast_ema_period}/{config.slow_ema_period}, "
-        f"RSI {config.rsi_period}, ATR {config.atr_period} x{config.atr_multiplier:g}\n"
+        f"RSI {config.rsi_period} (перегрев ≥70 / ≤30), "
+        f"ATR {config.atr_period} x{config.atr_multiplier:g}\n"
         f"Тейки: {config.take_profit_1_r:g}R / {config.take_profit_2_r:g}R\n"
         f"Интервал сканирования: {config.scan_interval_seconds} сек.\n"
         f"Последняя проверка: {last_scan}"
@@ -671,6 +734,38 @@ async def scan_market(context: ContextTypes.DEFAULT_TYPE) -> None:
                 LOG.warning("Not enough closed candles for %s", symbol)
                 return
             latest = candles[-1]
+            latest_rsi_state = detect_rsi_extreme(
+                [candle.close for candle in candles], config.rsi_period
+            )
+            previous_rsi_state = store.rsi_extreme_state(symbol, config.interval)
+            previous_rsi_timestamp, previous_rsi_label = (
+                previous_rsi_state if previous_rsi_state else (None, "neutral")
+            )
+            if previous_rsi_timestamp is None or latest.timestamp > previous_rsi_timestamp:
+                current_rsi_label = latest_rsi_state[0] if latest_rsi_state else "neutral"
+                if current_rsi_label != "neutral" and current_rsi_label != previous_rsi_label:
+                    rsi_value = latest_rsi_state[1]
+                    message = format_rsi_extreme(
+                        symbol,
+                        current_rsi_label,
+                        rsi_value,
+                        latest.close,
+                        latest.timestamp,
+                        config.interval,
+                    )
+                    for chat_id in subscribers:
+                        try:
+                            await context.bot.send_message(chat_id=chat_id, text=message)
+                        except TelegramError:
+                            LOG.exception(
+                                "Failed to deliver RSI extreme alert for %s to chat %s",
+                                symbol,
+                                chat_id,
+                            )
+                store.mark_rsi_extreme_processed(
+                    symbol, config.interval, latest.timestamp, current_rsi_label
+                )
+
             last_processed = store.last_processed(symbol, config.interval)
             if last_processed is not None and latest.timestamp <= last_processed:
                 return

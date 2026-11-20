@@ -1,7 +1,7 @@
 import unittest
 from unittest.mock import patch
 
-from strategy import Candle, atr, build_signal, ema, rsi
+from strategy import Candle, atr, build_signal, detect_rsi_extreme, ema, rsi
 
 
 class IndicatorTests(unittest.TestCase):
@@ -12,6 +12,16 @@ class IndicatorTests(unittest.TestCase):
     def test_rsi_is_bounded_and_handles_flat_market(self):
         self.assertEqual(rsi([10] * 16)[-1], 50)
         self.assertEqual(rsi(list(range(16)))[-1], 100)
+
+    def test_detects_rsi_overbought_oversold_and_neutral(self):
+        rising = list(range(16))
+        falling = list(range(16, 0, -1))
+        flat = [10] * 16
+
+        self.assertEqual(detect_rsi_extreme(rising), ("overbought", 100))
+        self.assertEqual(detect_rsi_extreme(falling), ("oversold", 0))
+        self.assertIsNone(detect_rsi_extreme(flat))
+        self.assertIsNone(detect_rsi_extreme([1, 2], period=14))
 
     def test_atr_uses_true_range_across_gaps(self):
         candles = [
