@@ -8,7 +8,7 @@ import os
 import sqlite3
 import time
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import httpx
 import websockets
@@ -35,6 +35,7 @@ DEFAULT_PRICE_ALERT_THRESHOLD = 5.0
 MIN_PRICE_ALERT_THRESHOLD = 0.1
 MAX_PRICE_ALERT_THRESHOLD = 1000.0
 LOG = logging.getLogger("bybit_signals")
+MOSCOW_TIMEZONE = timezone(timedelta(hours=3), name="MSK")
 
 
 @dataclass(frozen=True)
@@ -443,12 +444,12 @@ class BybitClient:
 
 def format_signal(signal: Signal, config: Config) -> str:
     direction_emoji = "🟢" if signal.direction == "LONG" else "🔴"
-    opened_at = datetime.fromtimestamp(signal.timestamp / 1000, tz=timezone.utc)
+    opened_at = datetime.fromtimestamp(signal.timestamp / 1000, tz=MOSCOW_TIMEZONE)
     interval_label = {"D": "1д", "W": "1н", "M": "1м"}.get(config.interval, f"{config.interval}м")
     return (
         f"🚨 СИГНАЛ • {signal.direction} {direction_emoji}\n"
         f"#{signal.symbol} · Bybit Perpetual · {interval_label}\n"
-        f"Время свечи: {opened_at:%Y-%m-%d %H:%M UTC}\n\n"
+        f"Время свечи: {opened_at:%Y-%m-%d %H:%M} МСК\n\n"
         f"💰 Вход: {format_price(signal.entry)}\n"
         f"🎯 Тейк 1: {format_price(signal.take_profit_1)} "
         f"({price_change(signal.entry, signal.take_profit_1, signal.direction):+.2f}%)\n"
@@ -471,7 +472,7 @@ def format_rsi_extreme(
     timestamp: int,
     interval: str,
 ) -> str:
-    opened_at = datetime.fromtimestamp(timestamp / 1000, tz=timezone.utc)
+    opened_at = datetime.fromtimestamp(timestamp / 1000, tz=MOSCOW_TIMEZONE)
     interval_label = {"D": "1д", "W": "1н", "M": "1м"}.get(interval, f"{interval}м")
     if state == "overbought":
         heading = "ПЕРЕКУПЛЕННОСТЬ"
@@ -485,7 +486,7 @@ def format_rsi_extreme(
         f"{emoji} RSI-СИГНАЛ • {heading}\n"
         f"#{symbol} · Bybit Perpetual · {interval_label}\n"
         f"RSI {rsi_value:.1f} · Цена закрытия свечи: {format_price(close)} USDT\n"
-        f"Время свечи: {opened_at:%Y-%m-%d %H:%M UTC}\n\n"
+        f"Время свечи: {opened_at:%Y-%m-%d %H:%M} МСК\n\n"
         f"{note}\n"
         "Это индикаторное предупреждение, а не рекомендация открывать сделку."
     )
@@ -867,8 +868,8 @@ async def handle_closed_candle(application: Application, interval: str, symbol: 
     ) + 5
     if len(candles) > keep_count:
         del candles[:-keep_count]
-    application.bot_data["last_market_event_at"] = datetime.now(timezone.utc).strftime(
-        "%Y-%m-%d %H:%M:%S UTC"
+    application.bot_data["last_market_event_at"] = datetime.now(MOSCOW_TIMEZONE).strftime(
+        "%Y-%m-%d %H:%M:%S МСК"
     )
 
     if interval != config.interval:
@@ -1035,6 +1036,7 @@ async def run_market_streams(application: Application) -> None:
 
 
 async def post_init(application: Application) -> None:
+    application.job_queue.scheduler.timezone = MOSCOW_TIMEZONE
     application.bot_data["http_client"] = httpx.AsyncClient(
         timeout=BYBIT_HTTP_TIMEOUT_SECONDS
     )

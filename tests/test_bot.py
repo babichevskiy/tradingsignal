@@ -63,6 +63,7 @@ class ConfigTests(unittest.TestCase):
         self.assertIn("Вход: 100.00", message)
         self.assertIn("Тейк 1: 103.00", message)
         self.assertIn("Стоп: 97.0000", message)
+        self.assertIn("Время свечи: 1970-01-01 03:00 МСК", message)
         self.assertIn("бот не торгует", message)
 
     def test_overheat_alert_warns_without_promising_a_reversal(self):
@@ -72,6 +73,7 @@ class ConfigTests(unittest.TestCase):
         self.assertIn("RSI 72.5", message)
         self.assertIn("Возможен откат вниз", message)
         self.assertIn("разворот не гарантирован", message)
+        self.assertIn("Время свечи: 1970-01-01 03:00 МСК", message)
 
 
 class BybitClientTests(unittest.TestCase):
@@ -204,6 +206,7 @@ class BybitClientTests(unittest.TestCase):
 
         self.assertEqual(asyncio.run(process_twice()), 1)
         self.assertEqual(store.last_processed("BTCUSDT", "15"), 60)
+        self.assertTrue(application.bot_data["last_market_event_at"].endswith("МСК"))
         store.close()
 
     def test_historical_candles_are_fetched_with_window_and_volume(self):
