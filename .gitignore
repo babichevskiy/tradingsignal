@@ -1,0 +1,7 @@
+.env
+.venv/
+__pycache__/
+*.py[cod]
+signals.sqlite3
+signals.sqlite3-shm
+signals.sqlite3-wal
