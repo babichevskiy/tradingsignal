@@ -23,6 +23,20 @@ ATR_MULTIPLIER = 1.5
 VOLUME_LOOKBACK = 20
 VOLUME_MULTIPLIER = 1.2
 TREND_EMA_PERIOD = 200
+FILTER_VARIANTS = (
+    (
+        f"EMA{TREND_EMA_PERIOD} + volume {VOLUME_MULTIPLIER:g}x",
+        TREND_EMA_PERIOD,
+        VOLUME_MULTIPLIER,
+    ),
+    ("EMA200 + volume 1.5x", 200, 1.5),
+    ("EMA200 + volume 2.0x", 200, 2.0),
+    ("EMA300 + volume 1.2x", 300, 1.2),
+    ("EMA300 + volume 1.5x", 300, 1.5),
+)
+CURRENT_FILTER_NAME = FILTER_VARIANTS[0][0]
+MIN_RESOLVED_FOR_SELECTION = 200
+MIN_VALIDATION_IMPROVEMENT_PP = 2.0
 TAKE_PROFIT_1_R = 1.0
 TAKE_PROFIT_2_R = 2.0
 OUTCOME_HORIZON_BARS = 96
@@ -47,6 +61,54 @@ class OutcomeCounts:
             self.pending += 1
         else:
             self.unresolved += 1
+
+    @property
+    def resolved(self) -> int:
+        return self.tp1_first + self.stop_first
+
+    @property
+    def win_rate(self) -> float:
+        return 100 * self.tp1_first / self.resolved if self.resolved else 0
+
+
+def new_window_counts() -> dict[str, OutcomeCounts]:
+    return {"train": OutcomeCounts(), "validation": OutcomeCounts()}
+
+
+def merge_counts(target: OutcomeCounts, source: OutcomeCounts) -> None:
+    target.signals += source.signals
+    target.tp1_first += source.tp1_first
+    target.stop_first += source.stop_first
+    target.unresolved += source.unresolved
+    target.pending += source.pending
+
+
+def select_filter_variant(
+    training: dict[str, OutcomeCounts],
+    validation: dict[str, OutcomeCounts],
+) -> str | None:
+    if (
+        training[CURRENT_FILTER_NAME].resolved < MIN_RESOLVED_FOR_SELECTION
+        or validation[CURRENT_FILTER_NAME].resolved < MIN_RESOLVED_FOR_SELECTION
+    ):
+        return None
+    eligible = [
+        name
+        for name, counts in training.items()
+        if counts.resolved >= MIN_RESOLVED_FOR_SELECTION
+    ]
+    if not eligible:
+        return None
+    best = max(eligible, key=lambda name: training[name].win_rate)
+    if best == CURRENT_FILTER_NAME:
+        return best
+    if (
+        validation[best].resolved < MIN_RESOLVED_FOR_SELECTION
+        or validation[best].win_rate
+        < validation[CURRENT_FILTER_NAME].win_rate + MIN_VALIDATION_IMPROVEMENT_PP
+    ):
+        return CURRENT_FILTER_NAME
+    return best
 
 
 def interval_milliseconds(interval: str) -> int:
@@ -101,7 +163,7 @@ def find_signal_candidates(
     candles: list[Candle],
     start_ms: int,
     end_ms: int,
-) -> list[tuple[int, Signal, Signal | None]]:
+) -> list[tuple[int, Signal, dict[str, Signal | None]]]:
     closes = [candle.close for candle in candles]
     fast = ema(closes, FAST_EMA_PERIOD)
     slow = ema(closes, SLOW_EMA_PERIOD)
@@ -136,14 +198,21 @@ def find_signal_candidates(
         )
         if baseline is None:
             continue
-        filtered = build_signal(
-            "BACKTEST",
-            history,
-            volume_multiplier=VOLUME_MULTIPLIER,
-            volume_lookback=VOLUME_LOOKBACK,
-        )
+        signals_by_volume = {
+            volume_multiplier: build_signal(
+                "BACKTEST",
+                history,
+                volume_multiplier=volume_multiplier,
+                volume_lookback=VOLUME_LOOKBACK,
+            )
+            for volume_multiplier in {variant[2] for variant in FILTER_VARIANTS}
+        }
         if volatility[atr_index] <= 0:
             continue
+        filtered = {
+            name: signals_by_volume[volume_multiplier]
+            for name, _, volume_multiplier in FILTER_VARIANTS
+        }
         candidates.append((index, baseline, filtered))
     return candidates
 
@@ -177,43 +246,57 @@ def run_symbol_backtest(
     trend_candles: list[Candle],
     start_ms: int,
     end_ms: int,
-) -> tuple[OutcomeCounts, OutcomeCounts]:
-    baseline_counts = OutcomeCounts()
-    filtered_counts = OutcomeCounts()
+    split_ms: int,
+) -> tuple[dict[str, OutcomeCounts], dict[str, dict[str, OutcomeCounts]]]:
+    baseline_counts = new_window_counts()
+    filtered_counts = {
+        name: new_window_counts() for name, _, _ in FILTER_VARIANTS
+    }
     candidates = find_signal_candidates(candles, start_ms, end_ms)
-    trend_step = interval_milliseconds(TREND_INTERVAL)
-    trend_index = -1
+    trend_steps = {period: interval_milliseconds(TREND_INTERVAL) for _, period, _ in FILTER_VARIANTS}
+    trend_indices = {period: -1 for _, period, _ in FILTER_VARIANTS}
 
-    for candle_index, baseline_signal, filtered_signal in candidates:
+    for candle_index, baseline_signal, signals_by_variant in candidates:
+        signal_time = candles[candle_index].timestamp
+        if signal_time < split_ms - OUTCOME_HORIZON_BARS * interval_milliseconds(BASE_INTERVAL):
+            window = "train"
+        elif signal_time >= split_ms:
+            window = "validation"
+        else:
+            continue
         future = candles[candle_index + 1 :]
-        baseline_counts.add(evaluate_outcome(baseline_signal, future))
-
-        if filtered_signal is None:
-            continue
         candle_close_time = candles[candle_index].timestamp + interval_milliseconds(BASE_INTERVAL)
-        while (
-            trend_index + 1 < len(trend_candles)
-            and trend_candles[trend_index + 1].timestamp + trend_step <= candle_close_time
-        ):
-            trend_index += 1
-        if trend_index < 0:
-            continue
-        if not confirm_trend(
-            filtered_signal, trend_candles[: trend_index + 1], TREND_EMA_PERIOD
-        ):
-            continue
-        filtered_counts.add(evaluate_outcome(filtered_signal, future))
+        baseline_counts[window].add(evaluate_outcome(baseline_signal, future))
+
+        for name, trend_period, _ in FILTER_VARIANTS:
+            signal = signals_by_variant[name]
+            if signal is None:
+                continue
+            trend_index = trend_indices[trend_period]
+            trend_step = trend_steps[trend_period]
+            while (
+                trend_index + 1 < len(trend_candles)
+                and trend_candles[trend_index + 1].timestamp + trend_step
+                <= candle_close_time
+            ):
+                trend_index += 1
+            trend_indices[trend_period] = trend_index
+            if trend_index < 0:
+                continue
+            if confirm_trend(
+                signal, trend_candles[: trend_index + 1], trend_period
+            ):
+                filtered_counts[name][window].add(evaluate_outcome(signal, future))
 
     return baseline_counts, filtered_counts
 
 
 def print_counts(label: str, counts: OutcomeCounts) -> None:
-    resolved = counts.tp1_first + counts.stop_first
-    win_rate = 100 * counts.tp1_first / resolved if resolved else 0
     print(
         f"{label}: сигналы={counts.signals}, TP1 раньше стопа={counts.tp1_first}, "
         f"стоп раньше TP1={counts.stop_first}, "
-        f"процент TP1 среди разрешенных={win_rate:.1f}%, "
+        f"процент TP1 среди разрешенных={counts.win_rate:.1f}% "
+        f"(разрешенных исходов={counts.resolved}), "
         f"не достигли уровня за 24ч={counts.unresolved}, "
         f"ожидают исхода={counts.pending}"
     )
@@ -222,11 +305,20 @@ def print_counts(label: str, counts: OutcomeCounts) -> None:
 async def run(args: argparse.Namespace) -> None:
     async with httpx.AsyncClient(timeout=30) as session:
         client = BybitClient(session)
-        symbols = (
-            await client.get_active_usdt_perpetual_symbols()
-            if args.symbols.upper() == "ALL"
-            else tuple(dict.fromkeys(part.strip().upper() for part in args.symbols.split(",") if part.strip()))
-        )
+        if args.top_by_turnover:
+            symbols = await client.get_top_usdt_perpetual_symbols_by_turnover(
+                args.top_by_turnover
+            )
+        elif args.symbols.upper() == "ALL":
+            symbols = await client.get_active_usdt_perpetual_symbols()
+        else:
+            symbols = tuple(
+                dict.fromkeys(
+                    part.strip().upper()
+                    for part in args.symbols.split(",")
+                    if part.strip()
+                )
+            )
         if not symbols:
             raise ValueError("No symbols were selected")
 
@@ -234,17 +326,23 @@ async def run(args: argparse.Namespace) -> None:
         end_ms = int(now.timestamp() * 1000)
         requested_start_ms = int((now - timedelta(days=args.days)).timestamp() * 1000)
         base_warmup_ms = (SLOW_EMA_PERIOD + VOLUME_LOOKBACK + 2) * interval_milliseconds(BASE_INTERVAL)
-        trend_warmup_ms = (TREND_EMA_PERIOD + 2) * interval_milliseconds(TREND_INTERVAL)
+        max_trend_period = max(period for _, period, _ in FILTER_VARIANTS)
+        trend_warmup_ms = (max_trend_period + 2) * interval_milliseconds(TREND_INTERVAL)
         base_start_ms = requested_start_ms - base_warmup_ms
         trend_start_ms = requested_start_ms - trend_warmup_ms
+        split_ms = requested_start_ms + (end_ms - requested_start_ms) * 2 // 3
 
-        baseline_total = OutcomeCounts()
-        filtered_total = OutcomeCounts()
+        baseline_total = new_window_counts()
+        filtered_total = {
+            name: new_window_counts() for name, _, _ in FILTER_VARIANTS
+        }
         semaphore = asyncio.Semaphore(MAX_CONCURRENT_SYMBOLS)
         completed = 0
         errors = 0
 
-        async def scan_symbol(symbol: str) -> tuple[OutcomeCounts, OutcomeCounts] | None:
+        async def scan_symbol(
+            symbol: str,
+        ) -> tuple[dict[str, OutcomeCounts], dict[str, dict[str, OutcomeCounts]]] | None:
             nonlocal completed, errors
             try:
                 async with semaphore:
@@ -260,6 +358,7 @@ async def run(args: argparse.Namespace) -> None:
                     trend_history,
                     requested_start_ms,
                     end_ms,
+                    split_ms,
                 )
                 return result
             except (httpx.HTTPError, RuntimeError, ValueError):
@@ -278,25 +377,50 @@ async def run(args: argparse.Namespace) -> None:
                 print(f"Пропущен рынок {symbol}: {result}")
                 continue
             baseline, filtered = result
-            baseline_total.signals += baseline.signals
-            baseline_total.tp1_first += baseline.tp1_first
-            baseline_total.stop_first += baseline.stop_first
-            baseline_total.unresolved += baseline.unresolved
-            baseline_total.pending += baseline.pending
-            filtered_total.signals += filtered.signals
-            filtered_total.tp1_first += filtered.tp1_first
-            filtered_total.stop_first += filtered.stop_first
-            filtered_total.unresolved += filtered.unresolved
-            filtered_total.pending += filtered.pending
+            for window in ("train", "validation"):
+                merge_counts(baseline_total[window], baseline[window])
+                for name, _, _ in FILTER_VARIANTS:
+                    merge_counts(
+                        filtered_total[name][window], filtered[name][window]
+                    )
 
     print(
         f"\nИстория: {args.days} дней, базовый ТФ {BASE_INTERVAL}м, "
-        f"фильтр тренда {TREND_INTERVAL}м EMA {TREND_EMA_PERIOD}, "
-        f"фильтр объема {VOLUME_MULTIPLIER}x/{VOLUME_LOOKBACK} свечей."
+        f"сигналы разделены по времени: первые 2/3 для отбора, последняя 1/3 для проверки. "
+        "Тренд EMA на 60м и объем сравниваются отдельно."
     )
-    print(f"Рынков: {len(symbols)}, ошибок загрузки: {errors}")
-    print_counts("Без новых фильтров", baseline_total)
-    print_counts("С фильтром EMA тренда и объема", filtered_total)
+    market_selection = (
+        f"топ {args.top_by_turnover} по обороту"
+        if args.top_by_turnover
+        else "все выбранные"
+    )
+    print(f"Рынков: {len(symbols)} ({market_selection}), ошибок загрузки: {errors}")
+    for window in ("train", "validation"):
+        print_counts(f"Без фильтров / {window}", baseline_total[window])
+    for name, _, _ in FILTER_VARIANTS:
+        for window in ("train", "validation"):
+            print_counts(f"{name} / {window}", filtered_total[name][window])
+    selected = select_filter_variant(
+        {name: counts["train"] for name, counts in filtered_total.items()},
+        {name: counts["validation"] for name, counts in filtered_total.items()},
+    )
+    if selected is None:
+        print(
+            "Рекомендация: данных недостаточно для выбора фильтра "
+            f"(нужно не менее {MIN_RESOLVED_FOR_SELECTION} TP1/стоп исходов на обучающем участке)."
+        )
+    elif selected == CURRENT_FILTER_NAME:
+        print(
+            "Рекомендация: оставить текущий фильтр; более строгий вариант не показал "
+            f"улучшение не менее чем на {MIN_VALIDATION_IMPROVEMENT_PP:.0f} п.п. "
+            "на проверочном участке с достаточным числом исходов."
+        )
+    else:
+        print(
+            f"Кандидат для проверки/внедрения: {selected}. "
+            "Он отобран на первых 2/3 истории и показал лучший win rate на последней 1/3; "
+            "это не гарантия будущего результата."
+        )
     print(
         "Исход TP1/стоп оценивается по максимуму 24 часа после сигнала; "
         "если одна свеча касается и TP1, и стопа, считается, что первым сработал стоп. "
@@ -310,10 +434,19 @@ def parse_args() -> argparse.Namespace:
         description="Historical comparison of the Bybit signal filters using public market data."
     )
     parser.add_argument("--symbols", default="ALL", help="ALL or comma-separated USDT symbols")
+    parser.add_argument(
+        "--top-by-turnover",
+        type=int,
+        help="Limit ALL to the top N active USDT perpetual markets by 24-hour turnover",
+    )
     parser.add_argument("--days", type=int, default=30, help="Lookback period in days (1-365)")
     args = parser.parse_args()
     if not 1 <= args.days <= 365:
         parser.error("--days must be between 1 and 365")
+    if args.top_by_turnover is not None and args.top_by_turnover < 1:
+        parser.error("--top-by-turnover must be positive")
+    if args.top_by_turnover is not None and args.symbols.upper() != "ALL":
+        parser.error("--top-by-turnover can only be used with --symbols ALL")
     return args
 
 

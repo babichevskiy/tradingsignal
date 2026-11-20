@@ -323,6 +323,39 @@ class BybitClient:
             raise RuntimeError("Bybit returned no active USDT perpetual contracts")
         return tuple(sorted(symbols))
 
+    async def get_top_usdt_perpetual_symbols_by_turnover(
+        self, limit: int
+    ) -> tuple[str, ...]:
+        if limit < 1:
+            raise ValueError("limit must be positive")
+        active_symbols = set(await self.get_active_usdt_perpetual_symbols())
+        payload = await self._get_payload(BYBIT_TICKERS_URL, {"category": "linear"})
+        result = payload.get("result")
+        if not isinstance(result, dict) or not isinstance(result.get("list"), list):
+            raise RuntimeError("Bybit returned malformed ticker data")
+
+        turnover_by_symbol = {}
+        for ticker in result["list"]:
+            if not isinstance(ticker, dict):
+                raise RuntimeError("Bybit returned malformed ticker data")
+            symbol = ticker.get("symbol")
+            if symbol not in active_symbols:
+                continue
+            try:
+                turnover = float(ticker["turnover24h"])
+            except (KeyError, TypeError, ValueError) as error:
+                raise RuntimeError(f"Bybit returned malformed ticker data for {symbol}") from error
+            if math.isfinite(turnover) and turnover >= 0:
+                turnover_by_symbol[symbol] = turnover
+        if not turnover_by_symbol:
+            raise RuntimeError("Bybit returned no active USDT perpetual tickers")
+        return tuple(
+            symbol
+            for symbol, _ in sorted(
+                turnover_by_symbol.items(), key=lambda item: item[1], reverse=True
+            )[:limit]
+        )
+
     async def get_closed_candles(
         self, symbol: str, interval: str, limit: int = 200
     ) -> list[Candle]:
@@ -415,7 +448,7 @@ class BybitClient:
         if self._request_lock is None:
             self._request_lock = asyncio.Lock()
         last_error: Exception | None = None
-        for attempt in range(3):
+        for attempt in range(5):
             async with self._request_lock:
                 now = asyncio.get_running_loop().time()
                 delay = BYBIT_REQUEST_INTERVAL_SECONDS - (now - self._last_request_at)
@@ -427,12 +460,25 @@ class BybitClient:
                 response = await self.client.get(url, params=params)
                 response.raise_for_status()
                 payload = response.json()
-                break
+            except httpx.HTTPStatusError as error:
+                if error.response.status_code != 429 or attempt == 4:
+                    raise
+                await asyncio.sleep(2**attempt)
+                continue
             except httpx.TransportError as error:
                 last_error = error
-                if attempt == 2:
+                if attempt == 4:
                     raise
                 await asyncio.sleep(1 + attempt)
+                continue
+            if isinstance(payload, dict) and payload.get("retCode") == 10006:
+                if attempt == 4:
+                    raise RuntimeError(
+                        f"Bybit returned retCode=10006: {payload.get('retMsg')}"
+                    )
+                await asyncio.sleep(2**attempt)
+                continue
+            break
         else:
             raise RuntimeError("Bybit request failed") from last_error
         if not isinstance(payload, dict) or payload.get("retCode") != 0:

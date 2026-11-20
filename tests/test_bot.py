@@ -3,7 +3,7 @@ import os
 import time
 import unittest
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import httpx
 
@@ -112,6 +112,51 @@ class BybitClientTests(unittest.TestCase):
                 return await BybitClient(FakeClient()).get_active_usdt_perpetual_symbols()
 
         self.assertEqual(asyncio.run(discover()), ("BTCUSDT", "ETHUSDT"))
+
+    def test_selects_top_active_perpetuals_by_turnover(self):
+        class FakeClient:
+            async def get(self, url, params):
+                if url.endswith("instruments-info"):
+                    response = {
+                        "retCode": 0,
+                        "result": {
+                            "list": [
+                                {
+                                    "symbol": symbol,
+                                    "status": "Trading",
+                                    "contractType": "LinearPerpetual",
+                                    "settleCoin": "USDT",
+                                }
+                                for symbol in ("BTCUSDT", "ETHUSDT", "SOLUSDT")
+                            ],
+                            "nextPageCursor": "",
+                        },
+                    }
+                else:
+                    response = {
+                        "retCode": 0,
+                        "result": {
+                            "list": [
+                                {"symbol": "BTCUSDT", "turnover24h": "100"},
+                                {"symbol": "ETHUSDT", "turnover24h": "200"},
+                                {"symbol": "SOLUSDT", "turnover24h": "150"},
+                                {"symbol": "NOTACTIVEUSDT", "turnover24h": "1000"},
+                            ]
+                        },
+                    }
+                return httpx.Response(
+                    200,
+                    request=httpx.Request("GET", url),
+                    json=response,
+                )
+
+        async def select():
+            with patch("bot.BYBIT_REQUEST_INTERVAL_SECONDS", 0):
+                return await BybitClient(FakeClient()).get_top_usdt_perpetual_symbols_by_turnover(
+                    2
+                )
+
+        self.assertEqual(asyncio.run(select()), ("ETHUSDT", "SOLUSDT"))
 
     def test_missing_symbol_cache_is_refreshed_even_if_timestamp_is_recent(self):
         with patch.dict(os.environ, {"TELEGRAM_BOT_TOKEN": "test-token"}, clear=True):
@@ -245,6 +290,42 @@ class BybitClientTests(unittest.TestCase):
 
         with self.assertRaisesRegex(RuntimeError, "invalid symbol"):
             asyncio.run(BybitClient(FakeClient()).get_closed_candles("BADUSDT", "15"))
+
+    def test_bybit_rate_limit_is_retried(self):
+        class FakeClient:
+            calls = 0
+
+            async def get(self, url, params):
+                self.calls += 1
+                result = (
+                    {"retCode": 10006, "retMsg": "Too many visits"}
+                    if self.calls == 1
+                    else {
+                        "retCode": 0,
+                        "result": {
+                            "list": [
+                                {"symbol": "BTCUSDT", "lastPrice": "65000", "price24hPcnt": "0.01"}
+                            ]
+                        },
+                    }
+                )
+                return httpx.Response(
+                    200,
+                    request=httpx.Request("GET", url),
+                    json=result,
+                )
+
+        fake_client = FakeClient()
+
+        async def fetch_tickers():
+            with (
+                patch("bot.BYBIT_REQUEST_INTERVAL_SECONDS", 0),
+                patch("bot.asyncio.sleep", new=AsyncMock()),
+            ):
+                return await BybitClient(fake_client).get_tickers({"BTCUSDT"})
+
+        self.assertEqual(asyncio.run(fetch_tickers()), {"BTCUSDT": (65000.0, 1.0)})
+        self.assertEqual(fake_client.calls, 2)
 
     def test_ticker_change_is_converted_to_percent(self):
         class FakeClient:

@@ -1,6 +1,12 @@
 import unittest
 
-from backtest import OutcomeCounts, evaluate_outcome, interval_milliseconds
+from backtest import (
+    CURRENT_FILTER_NAME,
+    OutcomeCounts,
+    evaluate_outcome,
+    interval_milliseconds,
+    select_filter_variant,
+)
 from strategy import Candle, Signal
 
 
@@ -39,6 +45,30 @@ class BacktestTests(unittest.TestCase):
             ),
             (4, 1, 1, 1, 1),
         )
+
+    def test_filter_selection_requires_a_holdout_improvement(self):
+        candidate = "EMA300 + volume 1.5x"
+        training = {
+            CURRENT_FILTER_NAME: OutcomeCounts(tp1_first=105, stop_first=95),
+            candidate: OutcomeCounts(tp1_first=130, stop_first=70),
+        }
+        validation = {
+            CURRENT_FILTER_NAME: OutcomeCounts(tp1_first=103, stop_first=97),
+            candidate: OutcomeCounts(tp1_first=112, stop_first=88),
+        }
+
+        self.assertEqual(select_filter_variant(training, validation), candidate)
+
+        validation[candidate] = OutcomeCounts(tp1_first=106, stop_first=94)
+        self.assertEqual(select_filter_variant(training, validation), CURRENT_FILTER_NAME)
+
+    def test_filter_selection_returns_none_without_enough_baseline_data(self):
+        counts = {
+            CURRENT_FILTER_NAME: OutcomeCounts(tp1_first=90, stop_first=90),
+            "EMA300 + volume 1.5x": OutcomeCounts(tp1_first=100, stop_first=80),
+        }
+
+        self.assertIsNone(select_filter_variant(counts, counts))
 
 
 if __name__ == "__main__":
