@@ -14,9 +14,12 @@ from bot import (
     evaluate_price_alert,
     format_rsi_extreme,
     format_signal,
-    get_scan_symbols,
+    get_market_symbols,
+    handle_closed_candle,
+    parse_confirmed_candle,
+    subscription_batches,
 )
-from strategy import Signal
+from strategy import Candle, Signal
 
 
 class ConfigTests(unittest.TestCase):
@@ -27,8 +30,9 @@ class ConfigTests(unittest.TestCase):
         self.assertTrue(config.all_usdt_perpetuals)
         self.assertEqual(config.symbols, ())
         self.assertEqual(config.interval, "15")
-        self.assertEqual(config.scan_interval_seconds, 300)
         self.assertEqual((config.fast_ema_period, config.slow_ema_period), (20, 50))
+        self.assertEqual((config.trend_interval, config.trend_ema_period), ("60", 200))
+        self.assertEqual((config.volume_multiplier, config.volume_lookback), (1.2, 20))
 
     def test_explicit_symbols_override_all_markets(self):
         with patch.dict(
@@ -121,7 +125,9 @@ class BybitClientTests(unittest.TestCase):
             )
         )
 
-        symbols = asyncio.run(get_scan_symbols(context, config, FakeBybitClient()))
+        symbols = asyncio.run(
+            get_market_symbols(context.application.bot_data, config, FakeBybitClient())
+        )
 
         self.assertEqual(symbols, ("BTCUSDT", "ETHUSDT"))
         self.assertEqual(context.application.bot_data["active_symbols"], symbols)
@@ -142,6 +148,88 @@ class BybitClientTests(unittest.TestCase):
 
         candles = asyncio.run(BybitClient(FakeClient()).get_closed_candles("BTCUSDT", "15"))
         self.assertEqual([candle.timestamp for candle in candles], [100, 200])
+        self.assertEqual(candles[0].volume, 100)
+
+    def test_confirmed_websocket_candle_is_parsed_and_open_candle_is_ignored(self):
+        message = {
+            "topic": "kline.15.BTCUSDT",
+            "data": [
+                {
+                    "start": "900000",
+                    "open": "10",
+                    "high": "12",
+                    "low": "9",
+                    "close": "11",
+                    "volume": "25",
+                    "confirm": True,
+                }
+            ],
+        }
+
+        parsed = parse_confirmed_candle(message)
+
+        self.assertEqual(parsed, ("BTCUSDT", Candle(900000, 10, 12, 9, 11, 25)))
+        message["data"][0]["confirm"] = False
+        self.assertIsNone(parse_confirmed_candle(message))
+
+    def test_websocket_topics_are_batched_under_bybit_argument_limit(self):
+        topics = [f"kline.15.COIN{index}USDT" for index in range(1000)]
+
+        batches = subscription_batches(topics)
+
+        self.assertGreater(len(batches), 1)
+        self.assertEqual([topic for batch in batches for topic in batch], topics)
+        self.assertTrue(all(sum(len(topic) + 3 for topic in batch) <= 18000 for batch in batches))
+
+    def test_duplicate_closed_websocket_candle_is_processed_once(self):
+        with patch.dict(os.environ, {"TELEGRAM_BOT_TOKEN": "test-token"}, clear=True):
+            config = Config.from_env()
+        store = SignalStore(":memory:")
+        history = [Candle(index, 100, 101, 99, 100, 10) for index in range(60)]
+        application = SimpleNamespace(
+            bot_data={
+                "config": config,
+                "store": store,
+                "candle_cache": {"15": {"BTCUSDT": history}},
+            },
+            bot=SimpleNamespace(),
+        )
+        candle = Candle(60, 100, 101, 99, 100, 10)
+
+        async def process_twice():
+            with patch("bot.build_signal", return_value=None) as build_signal_mock:
+                await handle_closed_candle(application, "15", "BTCUSDT", candle)
+                await handle_closed_candle(application, "15", "BTCUSDT", candle)
+                return build_signal_mock.call_count
+
+        self.assertEqual(asyncio.run(process_twice()), 1)
+        self.assertEqual(store.last_processed("BTCUSDT", "15"), 60)
+        store.close()
+
+    def test_historical_candles_are_fetched_with_window_and_volume(self):
+        class FakeClient:
+            async def get(self, url, params):
+                self.params = params
+                return httpx.Response(
+                    200,
+                    request=httpx.Request("GET", url),
+                    json={
+                        "retCode": 0,
+                        "result": {
+                            "list": [["100", "10", "12", "9", "11", "25", "275"]]
+                        },
+                    },
+                )
+
+        fake_client = FakeClient()
+        candles = asyncio.run(
+            BybitClient(fake_client).get_historical_candles(
+                "BTCUSDT", "15", 50, 150, limit=10
+            )
+        )
+        self.assertEqual(fake_client.params["start"], 50)
+        self.assertEqual(fake_client.params["end"], 150)
+        self.assertEqual(candles[0].volume, 25)
 
     def test_bybit_error_is_reported(self):
         class FakeClient:

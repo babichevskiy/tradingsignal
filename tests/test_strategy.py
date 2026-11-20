@@ -1,7 +1,16 @@
 import unittest
 from unittest.mock import patch
 
-from strategy import Candle, atr, build_signal, detect_rsi_extreme, ema, rsi
+from strategy import (
+    Candle,
+    Signal,
+    atr,
+    build_signal,
+    confirm_trend,
+    detect_rsi_extreme,
+    ema,
+    rsi,
+)
 
 
 class IndicatorTests(unittest.TestCase):
@@ -34,7 +43,10 @@ class IndicatorTests(unittest.TestCase):
 
 class SignalTests(unittest.TestCase):
     def test_signal_levels_are_directional_and_risk_based(self):
-        candles = [Candle(index, 100, 101, 99, 100) for index in range(60)]
+        candles = [
+            Candle(index, 100, 101, 99, 100, 10)
+            for index in range(59)
+        ] + [Candle(59, 100, 101, 99, 100, 12)]
         with (
             patch("strategy.ema", side_effect=[[1, 2], [2, 1]]),
             patch("strategy.rsi", return_value=[55, 60]),
@@ -49,7 +61,10 @@ class SignalTests(unittest.TestCase):
         self.assertEqual(signal.take_profit_2, 106)
 
     def test_short_signal_levels_are_directional(self):
-        candles = [Candle(index, 100, 101, 99, 100) for index in range(60)]
+        candles = [
+            Candle(index, 100, 101, 99, 100, 10)
+            for index in range(59)
+        ] + [Candle(59, 100, 101, 99, 100, 12)]
         with (
             patch("strategy.ema", side_effect=[[2, 1], [1, 2]]),
             patch("strategy.rsi", return_value=[45, 40]),
@@ -62,6 +77,31 @@ class SignalTests(unittest.TestCase):
         self.assertEqual(signal.stop_loss, 103)
         self.assertEqual(signal.take_profit_1, 97)
         self.assertEqual(signal.take_profit_2, 94)
+
+    def test_signal_is_rejected_when_volume_confirmation_is_missing(self):
+        candles = [Candle(index, 100, 101, 99, 100, 10) for index in range(60)]
+        with (
+            patch("strategy.ema", side_effect=[[1, 2], [2, 1]]),
+            patch("strategy.rsi", return_value=[55, 60]),
+            patch("strategy.atr", return_value=[1, 2]),
+        ):
+            signal = build_signal("TESTUSDT", candles, volume_multiplier=1.2)
+
+        self.assertIsNone(signal)
+
+    def test_trend_filter_accepts_only_signals_aligned_with_ema(self):
+        long_signal = Signal("TESTUSDT", "LONG", 110, 113, 116, 107, 0)
+        short_signal = Signal("TESTUSDT", "SHORT", 90, 87, 84, 93, 0)
+        uptrend = [Candle(index, 100, 101, 99, 100) for index in range(200)]
+        uptrend.append(Candle(200, 110, 111, 109, 110))
+        downtrend = [Candle(index, 100, 101, 99, 100) for index in range(200)]
+        downtrend.append(Candle(200, 90, 91, 89, 90))
+
+        self.assertTrue(confirm_trend(long_signal, uptrend))
+        self.assertFalse(confirm_trend(short_signal, uptrend))
+        self.assertTrue(confirm_trend(short_signal, downtrend))
+        self.assertFalse(confirm_trend(long_signal, downtrend))
+        self.assertFalse(confirm_trend(long_signal, uptrend[:100]))
 
     def test_no_signal_when_crossover_is_not_confirmed(self):
         candles = [

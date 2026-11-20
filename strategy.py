@@ -10,6 +10,7 @@ class Candle:
     high: float
     low: float
     close: float
+    volume: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -74,6 +75,19 @@ def detect_rsi_extreme(
     return None
 
 
+def confirm_trend(signal: Signal, candles: list[Candle], ema_period: int = 200) -> bool:
+    trend = ema([candle.close for candle in candles], ema_period)
+    if not trend:
+        return False
+    trend_ema = trend[-1]
+    latest_close = candles[-1].close
+    if signal.direction == "LONG":
+        return latest_close > trend_ema
+    if signal.direction == "SHORT":
+        return latest_close < trend_ema
+    return False
+
+
 def atr(candles: list[Candle], period: int = 14) -> list[float]:
     if period <= 0:
         raise ValueError("period must be positive")
@@ -108,6 +122,8 @@ def build_signal(
     atr_multiplier: float = 1.5,
     take_profit_1_r: float = 1,
     take_profit_2_r: float = 2,
+    volume_multiplier: float | None = 1.2,
+    volume_lookback: int = 20,
 ) -> Signal | None:
     closes = [candle.close for candle in candles]
     fast = ema(closes, fast_period)
@@ -126,6 +142,15 @@ def build_signal(
     entry = closes[-1]
     if entry <= 0 or current_atr <= 0:
         return None
+    if volume_multiplier is not None:
+        if volume_lookback <= 0 or len(candles) <= volume_lookback:
+            return None
+        average_volume = (
+            sum(candle.volume for candle in candles[-volume_lookback - 1 : -1])
+            / volume_lookback
+        )
+        if average_volume <= 0 or candles[-1].volume < average_volume * volume_multiplier:
+            return None
 
     if previous_fast <= previous_slow and current_fast > current_slow:
         if not 50 <= current_rsi < 70:
