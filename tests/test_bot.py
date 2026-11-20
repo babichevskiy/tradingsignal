@@ -7,7 +7,14 @@ from unittest.mock import patch
 
 import httpx
 
-from bot import BybitClient, Config, format_signal, get_scan_symbols
+from bot import (
+    BybitClient,
+    Config,
+    SignalStore,
+    evaluate_price_alert,
+    format_signal,
+    get_scan_symbols,
+)
 from strategy import Signal
 
 
@@ -138,6 +145,54 @@ class BybitClientTests(unittest.TestCase):
 
         with self.assertRaisesRegex(RuntimeError, "invalid symbol"):
             asyncio.run(BybitClient(FakeClient()).get_closed_candles("BADUSDT", "15"))
+
+    def test_ticker_change_is_converted_to_percent(self):
+        class FakeClient:
+            async def get(self, url, params):
+                return httpx.Response(
+                    200,
+                    request=httpx.Request("GET", url),
+                    json={
+                        "retCode": 0,
+                        "result": {
+                            "list": [
+                                {"symbol": "BTCUSDT", "lastPrice": "65000", "price24hPcnt": "0.0525"},
+                                {"symbol": "ETHUSDT", "lastPrice": "3000", "price24hPcnt": "-0.01"},
+                            ]
+                        },
+                    },
+                )
+
+        tickers = asyncio.run(BybitClient(FakeClient()).get_tickers({"BTCUSDT"}))
+        self.assertEqual(tickers, {"BTCUSDT": (65000.0, 5.25)})
+
+
+class WatchlistTests(unittest.TestCase):
+    def test_watchlist_is_chat_specific_and_can_be_removed(self):
+        store = SignalStore(":memory:")
+        store.subscribe(1)
+        store.subscribe(2)
+        store.watch(1, "BTCUSDT", 5)
+        store.watch(2, "BTCUSDT", 3)
+
+        self.assertEqual(store.watchlist(1), [("BTCUSDT", 5.0)])
+        self.assertEqual(store.watchlist(2), [("BTCUSDT", 3.0)])
+        self.assertEqual(
+            store.watched_symbols(),
+            [(1, "BTCUSDT", 5.0, None), (2, "BTCUSDT", 3.0, None)],
+        )
+
+        store.set_watch_alert_direction(1, "BTCUSDT", "up")
+        self.assertEqual(store.watchlist(1), [("BTCUSDT", 5.0)])
+        self.assertTrue(store.unwatch(1, "BTCUSDT"))
+        self.assertEqual(store.watchlist(1), [])
+        store.close()
+
+    def test_price_alert_uses_threshold_and_hysteresis(self):
+        self.assertEqual(evaluate_price_alert(5.1, 5, None), ("up", "up"))
+        self.assertEqual(evaluate_price_alert(6.0, 5, "up"), (None, "up"))
+        self.assertEqual(evaluate_price_alert(3.9, 5, "up"), (None, None))
+        self.assertEqual(evaluate_price_alert(-5.2, 5, "up"), ("down", "down"))
 
 
 if __name__ == "__main__":
