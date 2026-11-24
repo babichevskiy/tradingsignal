@@ -10,8 +10,10 @@ import httpx
 from bot import (
     BybitClient,
     Config,
+    PendingMarketAlert,
     SignalStore,
     calculate_market_analysis,
+    enqueue_market_alert,
     evaluate_price_alert,
     format_market_analysis,
     format_rsi_extreme,
@@ -21,6 +23,7 @@ from bot import (
     parse_confirmed_candle,
     broadcast_market_photo,
     render_market_chart,
+    run_signal_dispatcher,
     subscription_batches,
 )
 from strategy import Candle, Signal
@@ -164,6 +167,120 @@ class ConfigTests(unittest.TestCase):
         self.assertIn("разворот не гарантирован", message)
         self.assertIn("Время свечи: 1970-01-01 03:00 МСК", message)
         self.assertIn("отклонение от MA50", message)
+
+
+class SignalQueueTests(unittest.TestCase):
+    def test_dispatcher_skips_alerts_after_unsubscribe(self):
+        with patch.dict(os.environ, {"TELEGRAM_BOT_TOKEN": "test-token"}, clear=True):
+            config = Config.from_env()
+        store = SignalStore(":memory:")
+        store.subscribe(123)
+        application = SimpleNamespace(
+            bot_data={
+                "config": config,
+                "store": store,
+                "pending_alerts": [],
+                "queued_alert_keys": set(),
+            }
+        )
+        candles = [
+            Candle(index, 100, 101, 99, 100 + index * 0.01, 10)
+            for index in range(config.volume_lookback + 1)
+        ]
+        signal = Signal("BTCUSDT", "LONG", 100, 103, 106, 97, 20)
+
+        async def exercise_queue():
+            application.bot_data["signal_queue_event"] = asyncio.Event()
+            with patch("bot.SIGNAL_QUEUE_GATHER_SECONDS", 0), patch(
+                "bot.broadcast_market_photo", new=AsyncMock()
+            ) as send:
+                enqueue_market_alert(
+                    application, [123], "queued", candles, "BTCUSDT", "15", signal
+                )
+                store.unsubscribe(123)
+                task = asyncio.create_task(run_signal_dispatcher(application))
+                try:
+                    await asyncio.sleep(0.01)
+                finally:
+                    task.cancel()
+                    try:
+                        await task
+                    except asyncio.CancelledError:
+                        pass
+                self.assertEqual(send.await_count, 0)
+
+        asyncio.run(exercise_queue())
+        self.assertEqual(len(application.bot_data["pending_alerts"]), 0)
+        store.close()
+
+    def test_dispatcher_prioritizes_signals_and_enforces_cooldown(self):
+        with patch.dict(os.environ, {"TELEGRAM_BOT_TOKEN": "test-token"}, clear=True):
+            config = Config.from_env()
+        store = SignalStore(":memory:")
+        store.subscribe(123)
+        candles = [
+            Candle(index, 100, 101, 99, 100 + index * 0.01, 10)
+            for index in range(config.volume_lookback + 1)
+        ]
+        low_priority_candles = candles[:-1] + [Candle(20, 100, 101, 99, 100, 12)]
+        high_priority_candles = candles[:-1] + [Candle(20, 100, 101, 99, 100, 30)]
+        application = SimpleNamespace(
+            bot_data={
+                "config": config,
+                "store": store,
+                "pending_alerts": [],
+                "queued_alert_keys": set(),
+            }
+        )
+        low_priority_signal = Signal("BTCUSDT", "LONG", 100, 103, 106, 97, 20)
+        high_priority_signal = Signal("ETHUSDT", "LONG", 100, 103, 106, 97, 20)
+        delivered = []
+        stale_key = ("signal", "OLDUSDT", "15", 1)
+
+        async def record_delivery(*args):
+            delivered.append((args[4], asyncio.get_running_loop().time()))
+
+        async def exercise_queue():
+            application.bot_data["signal_queue_event"] = asyncio.Event()
+            with patch("bot.SIGNAL_QUEUE_GATHER_SECONDS", 0.02), patch(
+                "bot.SIGNAL_QUEUE_INTERVAL_SECONDS", 0.03
+            ), patch("bot.broadcast_market_photo", new=record_delivery):
+                enqueue_market_alert(
+                    application, [123], "low", low_priority_candles,
+                    "BTCUSDT", "15", low_priority_signal,
+                )
+                enqueue_market_alert(
+                    application, [123], "duplicate", low_priority_candles,
+                    "BTCUSDT", "15", low_priority_signal,
+                )
+                enqueue_market_alert(
+                    application, [123], "high", high_priority_candles,
+                    "ETHUSDT", "15", high_priority_signal,
+                )
+                application.bot_data["queued_alert_keys"].add(stale_key)
+                application.bot_data["pending_alerts"].append(
+                    PendingMarketAlert(
+                        (123,), "stale", tuple(candles), "OLDUSDT", "15",
+                        low_priority_signal, 1, 0, 0, stale_key,
+                    )
+                )
+                task = asyncio.create_task(run_signal_dispatcher(application))
+                try:
+                    await asyncio.sleep(0.09)
+                finally:
+                    task.cancel()
+                    try:
+                        await task
+                    except asyncio.CancelledError:
+                        pass
+
+        asyncio.run(exercise_queue())
+
+        self.assertEqual([symbol for symbol, _ in delivered], ["ETHUSDT", "BTCUSDT"])
+        self.assertGreaterEqual(delivered[1][1] - delivered[0][1], 0.025)
+        self.assertNotIn(stale_key, application.bot_data["queued_alert_keys"])
+        self.assertEqual(len(application.bot_data["pending_alerts"]), 0)
+        store.close()
 
 
 class BybitClientTests(unittest.TestCase):

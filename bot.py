@@ -37,6 +37,9 @@ MAX_CONCURRENT_SYMBOL_SCANS = 8
 MAX_SUBSCRIPTION_ARGUMENT_CHARS = 18000
 WS_SYMBOL_REFRESH_SECONDS = 60 * 60
 SIGNAL_CHART_CANDLES = 100
+SIGNAL_QUEUE_INTERVAL_SECONDS = 3 * 60
+SIGNAL_QUEUE_GATHER_SECONDS = 10
+SIGNAL_QUEUE_MIN_AGE_SECONDS = 15 * 60
 BYBIT_REQUEST_INTERVAL_SECONDS = 0.12
 BYBIT_HTTP_TIMEOUT_SECONDS = 30
 PRICE_ALERT_SCAN_SECONDS = 60
@@ -142,6 +145,20 @@ class Config:
             trend_interval=trend_interval,
             trend_ema_period=trend_ema_period,
         )
+
+
+@dataclass(frozen=True)
+class PendingMarketAlert:
+    chat_ids: tuple[int, ...]
+    text: str
+    candles: tuple[Candle, ...]
+    symbol: str
+    interval: str
+    signal: Signal | None
+    priority: float
+    queued_at: float
+    expires_at: float
+    dedup_key: tuple[str, str, str, int]
 
 
 class SignalStore:
@@ -747,6 +764,138 @@ async def broadcast_market_photo(
             LOG.exception("Failed to deliver market chart for %s to chat %s", symbol, chat_id)
 
 
+def signal_priority_score(
+    signal: Signal, candles: list[Candle], config: Config
+) -> float:
+    if len(candles) <= config.volume_lookback:
+        return 0
+    average_volume = (
+        sum(candle.volume for candle in candles[-config.volume_lookback - 1 : -1])
+        / config.volume_lookback
+    )
+    if average_volume <= 0:
+        return 0
+    volume_ratio = candles[-1].volume / average_volume
+    rsi_values = rsi([candle.close for candle in candles], config.rsi_period)
+    if not rsi_values:
+        return volume_ratio
+    preferred_rsi = 60 if signal.direction == "LONG" else 40
+    rsi_alignment = 1 - min(abs(rsi_values[-1] - preferred_rsi) / 20, 1)
+    return volume_ratio + rsi_alignment
+
+
+def enqueue_market_alert(
+    application: Application,
+    chat_ids: list[int],
+    text: str,
+    candles: list[Candle],
+    symbol: str,
+    interval: str,
+    signal: Signal | None = None,
+) -> None:
+    if not chat_ids:
+        return
+    kind = "signal" if signal else "rsi"
+    timestamp = signal.timestamp if signal else candles[-1].timestamp
+    dedup_key = (kind, symbol, interval, timestamp)
+    queued_keys: set[tuple[str, str, str, int]] = application.bot_data["queued_alert_keys"]
+    if dedup_key in queued_keys:
+        return
+
+    now = asyncio.get_running_loop().time()
+    ttl = max(
+        SIGNAL_QUEUE_MIN_AGE_SECONDS,
+        interval_minutes(interval) * 60,
+    )
+    alert = PendingMarketAlert(
+        chat_ids=tuple(chat_ids),
+        text=text,
+        candles=tuple(candles),
+        symbol=symbol,
+        interval=interval,
+        signal=signal,
+        priority=signal_priority_score(signal, candles, application.bot_data["config"])
+        if signal
+        else 0,
+        queued_at=now,
+        expires_at=now + ttl,
+        dedup_key=dedup_key,
+    )
+    application.bot_data["pending_alerts"].append(alert)
+    queued_keys.add(dedup_key)
+    application.bot_data["signal_queue_event"].set()
+    LOG.info(
+        "Queued %s alert for %s with priority %.2f (%d waiting)",
+        kind,
+        symbol,
+        alert.priority,
+        len(application.bot_data["pending_alerts"]),
+    )
+
+
+async def run_signal_dispatcher(application: Application) -> None:
+    pending: list[PendingMarketAlert] = application.bot_data["pending_alerts"]
+    queued_keys: set[tuple[str, str, str, int]] = application.bot_data["queued_alert_keys"]
+    queue_event: asyncio.Event = application.bot_data["signal_queue_event"]
+    loop = asyncio.get_running_loop()
+    next_send_at = loop.time()
+
+    while True:
+        now = loop.time()
+        retained = []
+        for alert in pending:
+            if alert.expires_at <= now:
+                queued_keys.discard(alert.dedup_key)
+                LOG.info(
+                    "Dropped stale queued alert for %s (%s)",
+                    alert.symbol,
+                    alert.interval,
+                )
+            else:
+                retained.append(alert)
+        pending[:] = retained
+
+        if not pending:
+            queue_event.clear()
+            await queue_event.wait()
+            continue
+
+        first_alert_at = min(alert.queued_at for alert in pending)
+        gather_until = first_alert_at + SIGNAL_QUEUE_GATHER_SECONDS
+        ready_at = max(gather_until, next_send_at)
+        delay = ready_at - now
+        if delay > 0:
+            queue_event.clear()
+            try:
+                await asyncio.wait_for(queue_event.wait(), timeout=delay)
+            except asyncio.TimeoutError:
+                pass
+            continue
+
+        alert = max(
+            pending,
+            key=lambda item: (item.priority, -item.queued_at, item.symbol),
+        )
+        pending.remove(alert)
+        queued_keys.discard(alert.dedup_key)
+        store: SignalStore = application.bot_data["store"]
+        active_chat_ids = set(store.subscribers())
+        chat_ids = [chat_id for chat_id in alert.chat_ids if chat_id in active_chat_ids]
+        if not chat_ids:
+            LOG.info("Skipped queued alert for %s: no active subscribers", alert.symbol)
+            continue
+        await broadcast_market_photo(
+            application,
+            chat_ids,
+            alert.text,
+            list(alert.candles),
+            alert.symbol,
+            alert.interval,
+            alert.signal,
+        )
+        next_send_at = loop.time() + SIGNAL_QUEUE_INTERVAL_SECONDS
+
+
 def format_price(price: float) -> str:
     return f"{price:.2f}" if price >= 100 else f"{price:.4f}" if price >= 1 else f"{price:.8f}".rstrip("0")
 
@@ -762,7 +911,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     store: SignalStore = context.application.bot_data["store"]
     store.subscribe(update.effective_chat.id)
     await update.message.reply_text(
-        "Подписка включена. Я отслеживаю публичные свечи Bybit и отправляю технические сигналы.\n"
+        "Подписка включена. Я отслеживаю публичные свечи Bybit и отправляю технические сигналы "
+        "по одному, не чаще одного раза в 3 минуты.\n"
         "Команды: /status, /symbols, /watch, /watchlist, /unwatch, /stop, /help."
     )
 
@@ -817,6 +967,8 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"Фильтры: EMA {config.trend_ema_period} ({config.trend_interval}), "
         f"объем ≥ {config.volume_multiplier:g}x среднего за {config.volume_lookback} свечей\n"
         f"Тейки: {config.take_profit_1_r:g}R / {config.take_profit_2_r:g}R\n"
+        f"Очередь сигналов: {len(context.application.bot_data.get('pending_alerts', []))} ожидает, "
+        "доставка не чаще 1 раза в 3 минуты\n"
         f"Поток Bybit: {stream_status}\n"
         f"Последняя закрытая свеча: {last_event}"
     )
@@ -1158,7 +1310,7 @@ async def handle_closed_candle(application: Application, interval: str, symbol: 
                 analysis,
             )
             if subscribers:
-                await broadcast_market_photo(
+                enqueue_market_alert(
                     application,
                     subscribers,
                     message,
@@ -1194,7 +1346,7 @@ async def handle_closed_candle(application: Application, interval: str, symbol: 
         if confirm_trend(signal, trend_candles, config.trend_ema_period):
             message = format_signal(signal, config, candles)
             if subscribers:
-                await broadcast_market_photo(
+                enqueue_market_alert(
                     application,
                     subscribers,
                     message,
@@ -1308,6 +1460,13 @@ async def post_init(application: Application) -> None:
         timeout=BYBIT_HTTP_TIMEOUT_SECONDS
     )
     application.bot_data["bybit"] = BybitClient(application.bot_data["http_client"])
+    application.bot_data["pending_alerts"] = []
+    application.bot_data["queued_alert_keys"] = set()
+    application.bot_data["signal_queue_event"] = asyncio.Event()
+    application.create_task(
+        run_signal_dispatcher(application),
+        name="signal-alert-dispatcher",
+    )
     application.create_task(
         run_market_streams(application),
         name="bybit-market-streams",
