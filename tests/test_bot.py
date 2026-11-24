@@ -11,12 +11,16 @@ from bot import (
     BybitClient,
     Config,
     SignalStore,
+    calculate_market_analysis,
     evaluate_price_alert,
+    format_market_analysis,
     format_rsi_extreme,
     format_signal,
     get_market_symbols,
     handle_closed_candle,
     parse_confirmed_candle,
+    broadcast_market_photo,
+    render_market_chart,
     subscription_batches,
 )
 from strategy import Candle, Signal
@@ -66,14 +70,100 @@ class ConfigTests(unittest.TestCase):
         self.assertIn("Время свечи: 1970-01-01 03:00 МСК", message)
         self.assertIn("бот не торгует", message)
 
+    def test_signal_message_adds_market_analysis(self):
+        with patch.dict(os.environ, {"TELEGRAM_BOT_TOKEN": "test-token"}, clear=True):
+            config = Config.from_env()
+        candles = [
+            Candle(index * 900_000, 100 + index, 102 + index, 99 + index, 100 + index, 10)
+            for index in range(100)
+        ]
+        signal = Signal("BTCUSDT", "LONG", 199, 202, 205, 196, candles[-1].timestamp)
+
+        message = format_signal(signal, config, candles)
+
+        self.assertIn("Анализ закрытых свечей", message)
+        self.assertIn("изменение за 24ч", message)
+        self.assertIn("RSI", message)
+        self.assertIn("MA50", message)
+
+    def test_market_analysis_reports_change_rsi_and_distance_from_ma50(self):
+        candles = [
+            Candle(index, 100 + index, 102 + index, 99 + index, 100 + index, 10)
+            for index in range(100)
+        ]
+
+        analysis = calculate_market_analysis(candles, "15", 14)
+        summary = format_market_analysis(analysis)
+
+        self.assertAlmostEqual(analysis["current_price"], 199)
+        self.assertAlmostEqual(analysis["change_24h_pct"], 96 / 103 * 100)
+        self.assertIsNotNone(analysis["rsi"])
+        self.assertIsNotNone(analysis["ma50_difference_pct"])
+        self.assertIn("отклонение от MA50", summary)
+
+    def test_market_chart_is_png_and_contains_signal_levels(self):
+        candles = [
+            Candle(
+                index * 900_000,
+                100 + index,
+                102 + index,
+                99 + index,
+                101 + index,
+                10,
+            )
+            for index in range(100)
+        ]
+        signal = Signal("BTCUSDT", "LONG", 200, 210, 220, 190, candles[-1].timestamp)
+
+        image = render_market_chart(candles, "BTCUSDT", "15", signal)
+
+        self.assertTrue(image.getvalue().startswith(b"\x89PNG\r\n\x1a\n"))
+
+    def test_market_chart_is_sent_as_a_telegram_photo(self):
+        candles = [
+            Candle(index * 900_000, 100 + index, 102 + index, 99 + index, 101 + index, 10)
+            for index in range(60)
+        ]
+        send_photo = AsyncMock()
+        application = SimpleNamespace(bot=SimpleNamespace(send_photo=send_photo))
+
+        asyncio.run(
+            broadcast_market_photo(
+                application,
+                [123],
+                "market analysis",
+                candles,
+                "BTCUSDT",
+                "15",
+            )
+        )
+
+        self.assertEqual(send_photo.await_count, 1)
+        self.assertEqual(send_photo.await_args.kwargs["chat_id"], 123)
+        self.assertEqual(
+            send_photo.await_args.kwargs["photo"].filename,
+            "btcusdt-analysis.png",
+        )
+
     def test_overheat_alert_warns_without_promising_a_reversal(self):
-        message = format_rsi_extreme("BTCUSDT", "overbought", 72.5, 65000, 0, "15")
+        analysis = {
+            "current_price": 65000,
+            "change_24h_pct": 2.5,
+            "change_period_hours": 24,
+            "rsi": 72.5,
+            "ma50": 64000,
+            "ma50_difference_pct": 1.56,
+        }
+        message = format_rsi_extreme(
+            "BTCUSDT", "overbought", 72.5, 65000, 0, "15", analysis
+        )
 
         self.assertIn("ПЕРЕКУПЛЕННОСТЬ", message)
         self.assertIn("RSI 72.5", message)
         self.assertIn("Возможен откат вниз", message)
         self.assertIn("разворот не гарантирован", message)
         self.assertIn("Время свечи: 1970-01-01 03:00 МСК", message)
+        self.assertIn("отклонение от MA50", message)
 
 
 class BybitClientTests(unittest.TestCase):

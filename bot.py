@@ -9,15 +9,23 @@ import sqlite3
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from io import BytesIO
 
 import httpx
+import matplotlib
+
+matplotlib.use("Agg")
+
+import matplotlib.dates as mdates
+import matplotlib.pyplot as plt
 import websockets
 from websockets.exceptions import WebSocketException
-from telegram import Update
+from matplotlib.patches import Rectangle
+from telegram import InputFile, Update
 from telegram.error import TelegramError
 from telegram.ext import Application, ApplicationBuilder, CommandHandler, ContextTypes
 
-from strategy import Candle, Signal, build_signal, confirm_trend, detect_rsi_extreme
+from strategy import Candle, Signal, build_signal, confirm_trend, detect_rsi_extreme, ema, rsi
 
 BYBIT_KLINE_URL = "https://api.bybit.com/v5/market/kline"
 BYBIT_INSTRUMENTS_URL = "https://api.bybit.com/v5/market/instruments-info"
@@ -28,6 +36,7 @@ SYMBOL_CACHE_SECONDS = 60 * 60
 MAX_CONCURRENT_SYMBOL_SCANS = 8
 MAX_SUBSCRIPTION_ARGUMENT_CHARS = 18000
 WS_SYMBOL_REFRESH_SECONDS = 60 * 60
+SIGNAL_CHART_CANDLES = 100
 BYBIT_REQUEST_INTERVAL_SECONDS = 0.12
 BYBIT_HTTP_TIMEOUT_SECONDS = 30
 PRICE_ALERT_SCAN_SECONDS = 60
@@ -488,11 +497,13 @@ class BybitClient:
         return payload
 
 
-def format_signal(signal: Signal, config: Config) -> str:
+def format_signal(
+    signal: Signal, config: Config, candles: list[Candle] | None = None
+) -> str:
     direction_emoji = "🟢" if signal.direction == "LONG" else "🔴"
     opened_at = datetime.fromtimestamp(signal.timestamp / 1000, tz=MOSCOW_TIMEZONE)
     interval_label = {"D": "1д", "W": "1н", "M": "1м"}.get(config.interval, f"{config.interval}м")
-    return (
+    message = (
         f"🚨 СИГНАЛ • {signal.direction} {direction_emoji}\n"
         f"#{signal.symbol} · Bybit Perpetual · {interval_label}\n"
         f"Время свечи: {opened_at:%Y-%m-%d %H:%M} МСК\n\n"
@@ -508,6 +519,179 @@ def format_signal(signal: Signal, config: Config) -> str:
         f"≥{config.volume_multiplier:g}x среднего. Уровни рассчитаны по ATR {config.atr_period}.\n"
         "Только аналитическая информация: бот не торгует и не является финансовой рекомендацией."
     )
+    if candles:
+        message += "\n\n" + format_market_analysis(
+            calculate_market_analysis(candles, config.interval, config.rsi_period)
+        )
+    return message
+
+
+def interval_minutes(interval: str) -> int:
+    if interval == "D":
+        return 24 * 60
+    if interval == "W":
+        return 7 * 24 * 60
+    if interval == "M":
+        return 30 * 24 * 60
+    return int(interval)
+
+
+def calculate_market_analysis(
+    candles: list[Candle], interval: str, rsi_period: int
+) -> dict[str, float | None]:
+    closes = [candle.close for candle in candles]
+    current_price = closes[-1]
+    lookback_bars = max(1, round(24 * 60 / interval_minutes(interval)))
+    price_change_24h = None
+    if len(closes) > lookback_bars:
+        reference_price = closes[-lookback_bars - 1]
+        if reference_price > 0:
+            price_change_24h = (current_price - reference_price) / reference_price * 100
+    change_period_hours = lookback_bars * interval_minutes(interval) / 60
+
+    rsi_values = rsi(closes, rsi_period)
+    ma50_values = ema(closes, 50)
+    rsi_value = rsi_values[-1] if rsi_values else None
+    ma50_value = ma50_values[-1] if ma50_values else None
+    ma50_difference = (
+        (current_price - ma50_value) / ma50_value * 100
+        if ma50_value is not None and ma50_value > 0
+        else None
+    )
+    return {
+        "current_price": current_price,
+        "change_24h_pct": price_change_24h,
+        "change_period_hours": change_period_hours,
+        "rsi": rsi_value,
+        "ma50": ma50_value,
+        "ma50_difference_pct": ma50_difference,
+    }
+
+
+def format_market_analysis(analysis: dict[str, float | None]) -> str:
+    change = analysis["change_24h_pct"]
+    rsi_value = analysis["rsi"]
+    ma50 = analysis["ma50"]
+    ma50_difference = analysis["ma50_difference_pct"]
+    change_period_hours = analysis["change_period_hours"]
+    change_period = (
+        "24ч"
+        if change_period_hours is not None and abs(change_period_hours - 24) < 0.01
+        else f"{change_period_hours:g}ч"
+        if change_period_hours is not None
+        else "24ч"
+    )
+    change_text = (
+        f"{change:+.2f}%"
+        if change is not None
+        else "недостаточно истории"
+    )
+    rsi_text = f"{rsi_value:.1f}" if rsi_value is not None else "недостаточно данных"
+    ma50_text = (
+        f"{format_price(ma50)} ({ma50_difference:+.2f}%)"
+        if ma50 is not None and ma50_difference is not None
+        else "недостаточно данных"
+    )
+    return (
+        f"📊 Анализ закрытых свечей: цена {format_price(analysis['current_price'])} USDT; "
+        f"изменение за {change_period} {change_text}; RSI {rsi_text}; "
+        f"отклонение от MA50 {ma50_text}."
+    )
+
+
+def render_market_chart(
+    candles: list[Candle],
+    symbol: str,
+    interval: str,
+    signal: Signal | None = None,
+) -> BytesIO:
+    chart_candles = candles[-SIGNAL_CHART_CANDLES:]
+    if len(chart_candles) < 2:
+        raise ValueError("At least two candles are required to render the signal chart")
+
+    timestamps = [
+        datetime.fromtimestamp(candle.timestamp / 1000, tz=timezone.utc)
+        for candle in chart_candles
+    ]
+    x_values = mdates.date2num(timestamps)
+    spacing = (
+        x_values[-1] - x_values[-2]
+        if x_values[-1] > x_values[-2]
+        else interval_minutes(interval) / (24 * 60)
+    )
+    figure, axis = plt.subplots(figsize=(12, 6), facecolor="#10121b")
+    axis.set_facecolor("#10121b")
+    for x_value, candle in zip(x_values, chart_candles):
+        rising = candle.close >= candle.open
+        color = "#35c98a" if rising else "#ef5364"
+        axis.vlines(x_value, candle.low, candle.high, color=color, linewidth=1)
+        body_bottom = min(candle.open, candle.close)
+        body_height = max(abs(candle.close - candle.open), abs(candle.close) * 0.00001)
+        axis.add_patch(
+            Rectangle(
+                (x_value - spacing * 0.32, body_bottom),
+                spacing * 0.64,
+                body_height,
+                facecolor=color,
+                edgecolor=color,
+                linewidth=0.6,
+            )
+        )
+
+    ma_values = ema([candle.close for candle in chart_candles], 50)
+    if ma_values:
+        axis.plot(
+            x_values[-len(ma_values):],
+            ma_values,
+            color="#f0b34a",
+            linewidth=1.2,
+            label="MA50",
+        )
+
+    levels = (
+        (
+            ("Вход", signal.entry, "#f5f5f5"),
+            ("TP1", signal.take_profit_1, "#35c98a"),
+            ("TP2", signal.take_profit_2, "#5c9cff"),
+            ("Стоп", signal.stop_loss, "#ef5364"),
+        )
+        if signal
+        else ()
+    )
+    for label, price, color in levels:
+        axis.axhline(price, color=color, linestyle="--", linewidth=1)
+        axis.text(
+            x_values[-1] + spacing * 1.5,
+            price,
+            f"{label} {format_price(price)}",
+            color=color,
+            va="center",
+            ha="left",
+            fontsize=8,
+        )
+
+    heading = f"{signal.direction} сигнал" if signal else "Анализ рынка"
+    axis.set_title(
+        f"{symbol} · {heading} · Bybit Perpetual · {interval}",
+        color="white",
+        loc="left",
+        fontsize=13,
+    )
+    axis.xaxis.set_major_formatter(
+        mdates.DateFormatter("%d.%m %H:%M", tz=MOSCOW_TIMEZONE)
+    )
+    axis.tick_params(colors="#b9bdc9", labelsize=8)
+    axis.grid(color="#343746", alpha=0.55, linewidth=0.6)
+    for spine in axis.spines.values():
+        spine.set_color("#424657")
+    axis.set_xlim(x_values[0] - spacing, x_values[-1] + spacing * 12)
+    figure.autofmt_xdate()
+    figure.tight_layout()
+    image = BytesIO()
+    figure.savefig(image, format="png", dpi=140, facecolor=figure.get_facecolor())
+    plt.close(figure)
+    image.seek(0)
+    return image
 
 
 def format_rsi_extreme(
@@ -517,6 +701,7 @@ def format_rsi_extreme(
     close: float,
     timestamp: int,
     interval: str,
+    analysis: dict[str, float | None] | None = None,
 ) -> str:
     opened_at = datetime.fromtimestamp(timestamp / 1000, tz=MOSCOW_TIMEZONE)
     interval_label = {"D": "1д", "W": "1н", "M": "1м"}.get(interval, f"{interval}м")
@@ -528,7 +713,7 @@ def format_rsi_extreme(
         heading = "ПЕРЕПРОДАННОСТЬ"
         note = "Возможен отскок вверх, но разворот не гарантирован."
         emoji = "🧊"
-    return (
+    message = (
         f"{emoji} RSI-СИГНАЛ • {heading}\n"
         f"#{symbol} · Bybit Perpetual · {interval_label}\n"
         f"RSI {rsi_value:.1f} · Цена закрытия свечи: {format_price(close)} USDT\n"
@@ -536,6 +721,30 @@ def format_rsi_extreme(
         f"{note}\n"
         "Это индикаторное предупреждение, а не рекомендация открывать сделку."
     )
+    if analysis:
+        message += "\n\n" + format_market_analysis(analysis)
+    return message
+
+
+async def broadcast_market_photo(
+    application: Application,
+    chat_ids: list[int],
+    text: str,
+    candles: list[Candle],
+    symbol: str,
+    interval: str,
+    signal: Signal | None = None,
+) -> None:
+    image = render_market_chart(candles, symbol, interval, signal).getvalue()
+    for chat_id in chat_ids:
+        try:
+            await application.bot.send_photo(
+                chat_id=chat_id,
+                photo=InputFile(image, filename=f"{symbol.lower()}-analysis.png"),
+                caption=text,
+            )
+        except TelegramError:
+            LOG.exception("Failed to deliver market chart for %s to chat %s", symbol, chat_id)
 
 
 def format_price(price: float) -> str:
@@ -905,12 +1114,17 @@ async def handle_closed_candle(application: Application, interval: str, symbol: 
     else:
         candles.append(candle)
 
+    interval_lookback_24h = max(
+        1, round(24 * 60 / interval_minutes(interval))
+    )
     keep_count = max(
         config.slow_ema_period,
         config.trend_ema_period if interval == config.trend_interval else 0,
         config.rsi_period + 1,
         config.atr_period + 1,
         config.volume_lookback + 1,
+        SIGNAL_CHART_CANDLES,
+        interval_lookback_24h + 1,
     ) + 5
     if len(candles) > keep_count:
         del candles[:-keep_count]
@@ -923,6 +1137,7 @@ async def handle_closed_candle(application: Application, interval: str, symbol: 
 
     store: SignalStore = application.bot_data["store"]
     subscribers = store.subscribers()
+    analysis = calculate_market_analysis(candles, interval, config.rsi_period)
     latest_rsi_state = detect_rsi_extreme(
         [item.close for item in candles], config.rsi_period
     )
@@ -940,16 +1155,17 @@ async def handle_closed_candle(application: Application, interval: str, symbol: 
                 candle.close,
                 candle.timestamp,
                 interval,
+                analysis,
             )
-            for chat_id in subscribers:
-                try:
-                    await application.bot.send_message(chat_id=chat_id, text=message)
-                except TelegramError:
-                    LOG.exception(
-                        "Failed to deliver RSI extreme alert for %s to chat %s",
-                        symbol,
-                        chat_id,
-                    )
+            if subscribers:
+                await broadcast_market_photo(
+                    application,
+                    subscribers,
+                    message,
+                    candles,
+                    symbol,
+                    interval,
+                )
         store.mark_rsi_extreme_processed(symbol, interval, candle.timestamp, current_label)
 
     last_processed = store.last_processed(symbol, interval)
@@ -976,12 +1192,17 @@ async def handle_closed_candle(application: Application, interval: str, symbol: 
             .get(symbol, [])
         )
         if confirm_trend(signal, trend_candles, config.trend_ema_period):
-            message = format_signal(signal, config)
-            for chat_id in subscribers:
-                try:
-                    await application.bot.send_message(chat_id=chat_id, text=message)
-                except TelegramError:
-                    LOG.exception("Failed to deliver signal for %s to chat %s", symbol, chat_id)
+            message = format_signal(signal, config, candles)
+            if subscribers:
+                await broadcast_market_photo(
+                    application,
+                    subscribers,
+                    message,
+                    candles,
+                    symbol,
+                    interval,
+                    signal,
+                )
         else:
             LOG.info(
                 "Ignored %s signal for %s: trend EMA %s on interval %s did not confirm",
