@@ -596,7 +596,9 @@ def format_signal(
     )
     message = (
         f"🚨 СИГНАЛ • {signal.direction} {direction_emoji}\n"
-        f"🏷 Стратегия: {signal.strategy}\n"
+        f"🏷 Стратегия: {signal.strategy}"
+        + (" • ОТДЕЛЬНАЯ КОНФЛЮЕНС-СТРАТЕГИЯ" if signal.strategy == EMA_PULLBACK_STRATEGY_NAME else " • БАЗОВАЯ EMA-СТРАТЕГИЯ")
+        + "\n"
         f"#{signal.symbol} · Bybit Perpetual · {interval_label}\n"
         f"Время свечи: {opened_at:%Y-%m-%d %H:%M} МСК\n\n"
         f"💰 Вход: {format_price(signal.entry)}\n"

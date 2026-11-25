@@ -8,6 +8,7 @@ from unittest.mock import AsyncMock, patch
 import httpx
 
 from bot import (
+    SIGNAL_QUEUE_INTERVAL_SECONDS,
     BybitClient,
     Config,
     PendingMarketAlert,
@@ -30,6 +31,9 @@ from strategy import Candle, EMA_PULLBACK_STRATEGY_NAME, Signal
 
 
 class ConfigTests(unittest.TestCase):
+    def test_all_strategy_alert_cooldown_is_fixed_to_three_minutes(self):
+        self.assertEqual(SIGNAL_QUEUE_INTERVAL_SECONDS, 180)
+
     def test_defaults_are_signal_only_and_configurable(self):
         with patch.dict(os.environ, {"TELEGRAM_BOT_TOKEN": "test-token"}, clear=True):
             config = Config.from_env()
@@ -121,6 +125,7 @@ class ConfigTests(unittest.TestCase):
         message = format_signal(signal, config, candles, interval="240")
 
         self.assertIn(f"Стратегия: {EMA_PULLBACK_STRATEGY_NAME}", message)
+        self.assertIn("ОТДЕЛЬНАЯ КОНФЛЮЕНС-СТРАТЕГИЯ", message)
         self.assertIn("4ч", message)
 
     def test_market_analysis_reports_change_rsi_and_distance_from_ma50(self):
