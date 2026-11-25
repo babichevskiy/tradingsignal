@@ -88,6 +88,112 @@ def confirm_trend(signal: Signal, candles: list[Candle], ema_period: int = 200) 
     return False
 
 
+def confirm_ema_ribbon(signal: Signal, candles: list[Candle]) -> bool:
+    closes = [candle.close for candle in candles]
+    lines = {period: ema(closes, period) for period in (20, 50, 100, 200)}
+    if any(not values for values in lines.values()):
+        return False
+    levels = [lines[period][-1] for period in (20, 50, 100, 200)]
+    if signal.direction == "LONG":
+        return levels[0] > levels[1] > levels[2] > levels[3] and closes[-1] > levels[0]
+    if signal.direction == "SHORT":
+        return levels[0] < levels[1] < levels[2] < levels[3] and closes[-1] < levels[0]
+    return False
+
+
+def build_ema_ribbon_pullback_signals(
+    symbol: str,
+    candles: list[Candle],
+    fast_period: int = 20,
+    ribbon_periods: tuple[int, ...] = (20, 50, 100, 200),
+    rsi_period: int = 14,
+    atr_period: int = 14,
+    atr_multiplier: float = 1.5,
+    take_profit_1_r: float = 1,
+    take_profit_2_r: float = 2,
+    volume_multiplier: float = 1.2,
+    volume_lookback: int = 20,
+) -> list[Signal]:
+    if len(ribbon_periods) < 2 or tuple(sorted(set(ribbon_periods))) != ribbon_periods:
+        raise ValueError("ribbon_periods must be unique and in ascending order")
+    if fast_period != ribbon_periods[0]:
+        raise ValueError("fast_period must be the shortest EMA ribbon period")
+    if volume_lookback <= 0 or volume_multiplier <= 0:
+        raise ValueError("volume_lookback and volume_multiplier must be positive")
+
+    closes = [candle.close for candle in candles]
+    lines = {period: ema(closes, period) for period in ribbon_periods}
+    momentum = rsi(closes, rsi_period)
+    volatility = atr(candles, atr_period)
+    warmup = max(max(ribbon_periods), rsi_period + 1, atr_period + 1, volume_lookback + 1)
+    if (
+        len(candles) <= warmup
+        or any(not values for values in lines.values())
+        or not momentum
+        or not volatility
+    ):
+        return []
+
+    signals = []
+    for index in range(warmup, len(candles)):
+        ema_levels = [
+            lines[period][index - (period - 1)] for period in ribbon_periods
+        ]
+        previous_fast = lines[fast_period][index - (fast_period - 1) - 1]
+        current_fast = ema_levels[0]
+        previous_close = candles[index - 1].close
+        current_close = candles[index].close
+        rsi_index = index - rsi_period
+        atr_index = index - atr_period
+        current_rsi = momentum[rsi_index]
+        current_atr = volatility[atr_index]
+        average_volume = (
+            sum(candle.volume for candle in candles[index - volume_lookback : index])
+            / volume_lookback
+        )
+        if (
+            current_atr <= 0
+            or average_volume <= 0
+            or candles[index].volume < average_volume * volume_multiplier
+        ):
+            continue
+
+        direction = None
+        if (
+            all(left > right for left, right in zip(ema_levels, ema_levels[1:]))
+            and previous_close <= previous_fast
+            and current_close > current_fast
+            and 50 <= current_rsi < 70
+        ):
+            direction = "LONG"
+        elif (
+            all(left < right for left, right in zip(ema_levels, ema_levels[1:]))
+            and previous_close >= previous_fast
+            and current_close < current_fast
+            and 30 < current_rsi <= 50
+        ):
+            direction = "SHORT"
+        if direction is None:
+            continue
+
+        risk = atr_multiplier * current_atr
+        if risk >= current_close or (direction == "SHORT" and take_profit_2_r * risk >= current_close):
+            continue
+        sign = 1 if direction == "LONG" else -1
+        signals.append(
+            Signal(
+                symbol=symbol,
+                direction=direction,
+                entry=current_close,
+                take_profit_1=current_close + sign * take_profit_1_r * risk,
+                take_profit_2=current_close + sign * take_profit_2_r * risk,
+                stop_loss=current_close - sign * risk,
+                timestamp=candles[index].timestamp,
+            )
+        )
+    return signals
+
+
 def atr(candles: list[Candle], period: int = 14) -> list[float]:
     if period <= 0:
         raise ValueError("period must be positive")

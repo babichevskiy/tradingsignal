@@ -6,7 +6,9 @@ from strategy import (
     Signal,
     atr,
     build_signal,
+    build_ema_ribbon_pullback_signals,
     confirm_trend,
+    confirm_ema_ribbon,
     detect_rsi_extreme,
     ema,
     rsi,
@@ -102,6 +104,38 @@ class SignalTests(unittest.TestCase):
         self.assertTrue(confirm_trend(short_signal, downtrend))
         self.assertFalse(confirm_trend(long_signal, downtrend))
         self.assertFalse(confirm_trend(long_signal, uptrend[:100]))
+
+    def test_ema_ribbon_filter_requires_ordered_levels_and_price_position(self):
+        long_signal = Signal("TESTUSDT", "LONG", 110, 113, 116, 107, 0)
+        candles = [Candle(index, 100, 111, 99, 110) for index in range(201)]
+
+        with patch("strategy.ema", side_effect=[[108] * 182, [106] * 152, [104] * 102, [102, 102]]):
+            self.assertTrue(confirm_ema_ribbon(long_signal, candles))
+        with patch("strategy.ema", side_effect=[[108] * 182, [109] * 152, [104] * 102, [102, 102]]):
+            self.assertFalse(confirm_ema_ribbon(long_signal, candles))
+
+    def test_ema_ribbon_pullback_generates_signal_after_reclaim_with_volume(self):
+        candles = [Candle(index, 100, 101, 99, 100, 10) for index in range(201)]
+        candles[-2] = Candle(199, 100, 101, 99, 104, 10)
+        candles[-1] = Candle(200, 104, 107, 103, 106, 12)
+
+        def fake_ema(values, period):
+            level = {20: 105, 50: 104, 100: 103, 200: 102}[period]
+            return [level] * (len(values) - period + 1)
+
+        with (
+            patch("strategy.ema", side_effect=fake_ema),
+            patch("strategy.rsi", return_value=[60] * (len(candles) - 14)),
+            patch("strategy.atr", return_value=[1] * (len(candles) - 14)),
+        ):
+            signals = build_ema_ribbon_pullback_signals("TESTUSDT", candles)
+
+        self.assertEqual(len(signals), 1)
+        self.assertEqual(signals[0].symbol, "TESTUSDT")
+        self.assertEqual(signals[0].direction, "LONG")
+        self.assertEqual(signals[0].entry, 106)
+        self.assertEqual(signals[0].stop_loss, 104.5)
+        self.assertEqual(signals[0].take_profit_1, 107.5)
 
     def test_no_signal_when_crossover_is_not_confirmed(self):
         candles = [

@@ -3,6 +3,7 @@ import unittest
 from backtest import (
     CURRENT_FILTER_NAME,
     OutcomeCounts,
+    ema_ribbon_candidate_passes_validation,
     evaluate_outcome,
     interval_milliseconds,
     select_filter_variant,
@@ -69,6 +70,30 @@ class BacktestTests(unittest.TestCase):
         }
 
         self.assertIsNone(select_filter_variant(counts, counts))
+
+    def test_ema_ribbon_pullback_requires_training_and_holdout_improvement(self):
+        baseline_train = OutcomeCounts(tp1_first=105, stop_first=95)
+        baseline_validation = OutcomeCounts(tp1_first=105, stop_first=95)
+        candidate_train = OutcomeCounts(tp1_first=120, stop_first=80)
+        candidate_validation = OutcomeCounts(tp1_first=110, stop_first=90)
+
+        self.assertTrue(
+            ema_ribbon_candidate_passes_validation(
+                baseline_train,
+                baseline_validation,
+                candidate_train,
+                candidate_validation,
+            )
+        )
+        candidate_validation = OutcomeCounts(tp1_first=107, stop_first=93)
+        self.assertFalse(
+            ema_ribbon_candidate_passes_validation(
+                baseline_train,
+                baseline_validation,
+                candidate_train,
+                candidate_validation,
+            )
+        )
 
 
 if __name__ == "__main__":

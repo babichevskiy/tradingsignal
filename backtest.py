@@ -10,7 +10,17 @@ from datetime import datetime, timedelta, timezone
 import httpx
 
 from bot import BybitClient
-from strategy import Candle, Signal, atr, build_signal, confirm_trend, ema, rsi
+from strategy import (
+    Candle,
+    Signal,
+    atr,
+    build_ema_ribbon_pullback_signals,
+    build_signal,
+    confirm_ema_ribbon,
+    confirm_trend,
+    ema,
+    rsi,
+)
 
 DEFAULT_SYMBOLS = ("BTCUSDT", "ETHUSDT", "SOLUSDT")
 BASE_INTERVAL = "15"
@@ -33,7 +43,9 @@ FILTER_VARIANTS = (
     ("EMA200 + volume 2.0x", 200, 2.0),
     ("EMA300 + volume 1.2x", 300, 1.2),
     ("EMA300 + volume 1.5x", 300, 1.5),
+    ("EMA20/50/100/200 ribbon + volume 1.2x", 0, 1.2),
 )
+EMA_RIBBON_PULLBACK_NAME = "EMA ribbon 20/50/100/200 pullback + volume 1.2x"
 CURRENT_FILTER_NAME = FILTER_VARIANTS[0][0]
 MIN_RESOLVED_FOR_SELECTION = 200
 MIN_VALIDATION_IMPROVEMENT_PP = 2.0
@@ -109,6 +121,23 @@ def select_filter_variant(
     ):
         return CURRENT_FILTER_NAME
     return best
+
+
+def ema_ribbon_candidate_passes_validation(
+    baseline_train: OutcomeCounts,
+    baseline_validation: OutcomeCounts,
+    candidate_train: OutcomeCounts,
+    candidate_validation: OutcomeCounts,
+) -> bool:
+    return (
+        baseline_train.resolved >= MIN_RESOLVED_FOR_SELECTION
+        and baseline_validation.resolved >= MIN_RESOLVED_FOR_SELECTION
+        and candidate_train.resolved >= MIN_RESOLVED_FOR_SELECTION
+        and candidate_validation.resolved >= MIN_RESOLVED_FOR_SELECTION
+        and candidate_train.win_rate > baseline_train.win_rate
+        and candidate_validation.win_rate
+        >= baseline_validation.win_rate + MIN_VALIDATION_IMPROVEMENT_PP
+    )
 
 
 def interval_milliseconds(interval: str) -> int:
@@ -217,6 +246,18 @@ def find_signal_candidates(
     return candidates
 
 
+def find_ema_ribbon_pullback_signals(
+    symbol: str, candles: list[Candle], start_ms: int, end_ms: int
+) -> list[tuple[int, Signal]]:
+    signals = build_ema_ribbon_pullback_signals(symbol, candles)
+    index_by_timestamp = {candle.timestamp: index for index, candle in enumerate(candles)}
+    return [
+        (index_by_timestamp[signal.timestamp], signal)
+        for signal in signals
+        if start_ms <= signal.timestamp <= end_ms
+    ]
+
+
 def evaluate_outcome(
     signal: Signal,
     future_candles: list[Candle],
@@ -247,14 +288,22 @@ def run_symbol_backtest(
     start_ms: int,
     end_ms: int,
     split_ms: int,
-) -> tuple[dict[str, OutcomeCounts], dict[str, dict[str, OutcomeCounts]]]:
+) -> tuple[
+    dict[str, OutcomeCounts],
+    dict[str, dict[str, OutcomeCounts]],
+    dict[str, OutcomeCounts],
+]:
     baseline_counts = new_window_counts()
     filtered_counts = {
         name: new_window_counts() for name, _, _ in FILTER_VARIANTS
     }
     candidates = find_signal_candidates(candles, start_ms, end_ms)
-    trend_steps = {period: interval_milliseconds(TREND_INTERVAL) for _, period, _ in FILTER_VARIANTS}
-    trend_indices = {period: -1 for _, period, _ in FILTER_VARIANTS}
+    trend_periods = {period for _, period, _ in FILTER_VARIANTS if period > 0}
+    trend_steps = {
+        period: interval_milliseconds(TREND_INTERVAL) for period in trend_periods
+    }
+    trend_indices = {period: -1 for period in trend_periods}
+    ribbon_pullback_counts = new_window_counts()
 
     for candle_index, baseline_signal, signals_by_variant in candidates:
         signal_time = candles[candle_index].timestamp
@@ -272,6 +321,10 @@ def run_symbol_backtest(
             signal = signals_by_variant[name]
             if signal is None:
                 continue
+            if trend_period == 0:
+                if confirm_ema_ribbon(signal, candles[: candle_index + 1]):
+                    filtered_counts[name][window].add(evaluate_outcome(signal, future))
+                continue
             trend_index = trend_indices[trend_period]
             trend_step = trend_steps[trend_period]
             while (
@@ -288,7 +341,21 @@ def run_symbol_backtest(
             ):
                 filtered_counts[name][window].add(evaluate_outcome(signal, future))
 
-    return baseline_counts, filtered_counts
+    for candle_index, signal in find_ema_ribbon_pullback_signals(
+        symbol, candles, start_ms, end_ms
+    ):
+        signal_time = signal.timestamp
+        if signal_time < split_ms - OUTCOME_HORIZON_BARS * interval_milliseconds(BASE_INTERVAL):
+            window = "train"
+        elif signal_time >= split_ms:
+            window = "validation"
+        else:
+            continue
+        ribbon_pullback_counts[window].add(
+            evaluate_outcome(signal, candles[candle_index + 1 :])
+        )
+
+    return baseline_counts, filtered_counts, ribbon_pullback_counts
 
 
 def print_counts(label: str, counts: OutcomeCounts) -> None:
@@ -325,8 +392,12 @@ async def run(args: argparse.Namespace) -> None:
         now = datetime.now(timezone.utc)
         end_ms = int(now.timestamp() * 1000)
         requested_start_ms = int((now - timedelta(days=args.days)).timestamp() * 1000)
-        base_warmup_ms = (SLOW_EMA_PERIOD + VOLUME_LOOKBACK + 2) * interval_milliseconds(BASE_INTERVAL)
-        max_trend_period = max(period for _, period, _ in FILTER_VARIANTS)
+        base_warmup_ms = (
+            max(SLOW_EMA_PERIOD, 200) + VOLUME_LOOKBACK + 2
+        ) * interval_milliseconds(BASE_INTERVAL)
+        max_trend_period = max(
+            period for _, period, _ in FILTER_VARIANTS if period > 0
+        )
         trend_warmup_ms = (max_trend_period + 2) * interval_milliseconds(TREND_INTERVAL)
         base_start_ms = requested_start_ms - base_warmup_ms
         trend_start_ms = requested_start_ms - trend_warmup_ms
@@ -336,13 +407,18 @@ async def run(args: argparse.Namespace) -> None:
         filtered_total = {
             name: new_window_counts() for name, _, _ in FILTER_VARIANTS
         }
+        ribbon_pullback_total = new_window_counts()
         semaphore = asyncio.Semaphore(MAX_CONCURRENT_SYMBOLS)
         completed = 0
         errors = 0
 
         async def scan_symbol(
             symbol: str,
-        ) -> tuple[dict[str, OutcomeCounts], dict[str, dict[str, OutcomeCounts]]] | None:
+        ) -> tuple[
+            dict[str, OutcomeCounts],
+            dict[str, dict[str, OutcomeCounts]],
+            dict[str, OutcomeCounts],
+        ] | None:
             nonlocal completed, errors
             try:
                 async with semaphore:
@@ -376,9 +452,10 @@ async def run(args: argparse.Namespace) -> None:
             if isinstance(result, BaseException):
                 print(f"Пропущен рынок {symbol}: {result}")
                 continue
-            baseline, filtered = result
+            baseline, filtered, ribbon_pullback = result
             for window in ("train", "validation"):
                 merge_counts(baseline_total[window], baseline[window])
+                merge_counts(ribbon_pullback_total[window], ribbon_pullback[window])
                 for name, _, _ in FILTER_VARIANTS:
                     merge_counts(
                         filtered_total[name][window], filtered[name][window]
@@ -387,7 +464,7 @@ async def run(args: argparse.Namespace) -> None:
     print(
         f"\nИстория: {args.days} дней, базовый ТФ {BASE_INTERVAL}м, "
         f"сигналы разделены по времени: первые 2/3 для отбора, последняя 1/3 для проверки. "
-        "Тренд EMA на 60м и объем сравниваются отдельно."
+        "Фильтры EMA на 60м, EMA-лента и объем сравниваются; возврат к EMA20 тестируется отдельно."
     )
     market_selection = (
         f"топ {args.top_by_turnover} по обороту"
@@ -400,6 +477,11 @@ async def run(args: argparse.Namespace) -> None:
     for name, _, _ in FILTER_VARIANTS:
         for window in ("train", "validation"):
             print_counts(f"{name} / {window}", filtered_total[name][window])
+    for window in ("train", "validation"):
+        print_counts(
+            f"{EMA_RIBBON_PULLBACK_NAME} / {window}",
+            ribbon_pullback_total[window],
+        )
     selected = select_filter_variant(
         {name: counts["train"] for name, counts in filtered_total.items()},
         {name: counts["validation"] for name, counts in filtered_total.items()},
@@ -420,6 +502,24 @@ async def run(args: argparse.Namespace) -> None:
             f"Кандидат для проверки/внедрения: {selected}. "
             "Он отобран на первых 2/3 истории и показал лучший win rate на последней 1/3; "
             "это не гарантия будущего результата."
+        )
+    if ema_ribbon_candidate_passes_validation(
+        filtered_total[CURRENT_FILTER_NAME]["train"],
+        filtered_total[CURRENT_FILTER_NAME]["validation"],
+        ribbon_pullback_total["train"],
+        ribbon_pullback_total["validation"],
+    ):
+        print(
+            f"EMA pullback-кандидат {EMA_RIBBON_PULLBACK_NAME} прошел текущий "
+            "критерий отбора/проверки. Перед включением в бота требуется отдельное "
+            "решение; проверка не гарантирует будущую прибыль."
+        )
+    else:
+        print(
+            "EMA pullback-стратегия не прошла критерий: для отбора нужны минимум "
+            f"{MIN_RESOLVED_FOR_SELECTION} TP1/стоп исходов в train и validation, "
+            f"улучшение train и не менее {MIN_VALIDATION_IMPROVEMENT_PP:.0f} п.п. "
+            "на контрольной выборке относительно текущего фильтра."
         )
     print(
         "Исход TP1/стоп оценивается по максимуму 24 часа после сигнала; "
