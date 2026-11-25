@@ -445,7 +445,8 @@ class BybitClientTests(unittest.TestCase):
             config = Config.from_env()
 
         class FakeBybitClient:
-            async def get_active_usdt_perpetual_symbols(self):
+            async def get_top_usdt_perpetual_symbols_by_turnover(self, limit):
+                self.limit = limit
                 return ("BTCUSDT", "ETHUSDT")
 
         context = SimpleNamespace(
@@ -526,13 +527,13 @@ class BybitClientTests(unittest.TestCase):
         candle = Candle(60, 100, 101, 99, 100, 10)
 
         async def process_twice():
-            with patch("bot.build_signal", return_value=None) as build_signal_mock:
+            with patch("bot.build_ema_pullback_signal", return_value=None) as build_pullback_mock:
                 await handle_closed_candle(application, "15", "BTCUSDT", candle)
                 await handle_closed_candle(application, "15", "BTCUSDT", candle)
-                return build_signal_mock.call_count
+                return build_pullback_mock.call_count
 
-        self.assertEqual(asyncio.run(process_twice()), 1)
-        self.assertEqual(store.last_processed("BTCUSDT", "15"), 60)
+        self.assertEqual(asyncio.run(process_twice()), 0)
+        self.assertIsNone(store.last_strategy_processed(EMA_PULLBACK_STRATEGY_NAME, "BTCUSDT", "15"))
         self.assertTrue(application.bot_data["last_market_event_at"].endswith("МСК"))
         store.close()
 

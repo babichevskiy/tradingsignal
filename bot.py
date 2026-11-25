@@ -46,6 +46,7 @@ SYMBOL_CACHE_SECONDS = 60 * 60
 MAX_CONCURRENT_SYMBOL_SCANS = 8
 MAX_SUBSCRIPTION_ARGUMENT_CHARS = 18000
 WS_SYMBOL_REFRESH_SECONDS = 60 * 60
+LIQUID_MARKET_LIMIT = 150
 SIGNAL_CHART_CANDLES = 100
 SIGNAL_QUEUE_INTERVAL_SECONDS = 3 * 60
 SIGNAL_QUEUE_GATHER_SECONDS = 10
@@ -997,8 +998,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     store.subscribe(update.effective_chat.id)
     await update.message.reply_text(
         "Подписка включена. Я отслеживаю публичные свечи Bybit и отправляю технические сигналы "
-        "по одному, не чаще одного раза в 3 минуты. Метка EMA PULLBACK CONFLUENCE обозначает отдельную "
-        "стратегию отката на старшем таймфрейме.\n"
+        "только по отдельной стратегии EMA PULLBACK 20/50/200 CONFLUENCE, "
+        "по одному, не чаще одного раза в 3 минуты.\n"
         "Команды: /status, /symbols, /watch, /watchlist, /unwatch, /stop, /help."
     )
 
@@ -1014,13 +1015,9 @@ async def stop(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.message:
         await update.message.reply_text(
-            "Я отслеживаю публичные USDT perpetual-контракты Bybit и сообщаю о пересечениях EMA "
-            "с подтверждением RSI. Также сообщаю о входе RSI в зоны перекупленности (≥70) "
-            "и перепроданности (≤30); это предупреждение о возможном откате/отскоке, "
-            "не гарантия разворота. Сигналы на вход дополнительно фильтруются EMA тренда "
-            "и повышенным объемом. Отдельно работает EMA PULLBACK 20/50/200 CONFLUENCE: направление "
-            "по выстроенным EMA, вход после отката и подтверждающей свечи (поглощение/пин-бар), "
-            "дополнительно подтвержденные RSI и объемом "
+            "Я отслеживаю публичные USDT perpetual-контракты Bybit и отправляю только "
+            "сигнал EMA PULLBACK 20/50/200 CONFLUENCE: направление по выстроенным EMA 20/50/200, "
+            "откат к EMA20/50, подтверждение поглощением или пин-баром, а также RSI и объем "
             f"на {format_interval_label(context.application.bot_data['config'].ema_pullback_interval)}.\n"
             "Я не принимаю ордера и не использую ключи биржи.\n\n"
             "/start — подписаться\n/status — состояние бота\n/symbols — список рынков\n"
@@ -1049,14 +1046,12 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
         f"Режим: сигналы без торговли\n"
         f"Рынки: {markets}\n"
-        f"Таймфрейм: {config.interval}\n"
+        f"Таймфрейм: {format_interval_label(config.ema_pullback_interval)}\n"
         f"Дополнительная стратегия: EMA PULLBACK 20/50/200 CONFLUENCE на "
         f"{format_interval_label(config.ema_pullback_interval)}\n"
-        f"Стратегия: EMA {config.fast_ema_period}/{config.slow_ema_period}, "
-        f"RSI {config.rsi_period} (перегрев ≥70 / ≤30), "
-        f"ATR {config.atr_period} x{config.atr_multiplier:g}\n"
-        f"Фильтры: EMA {config.trend_ema_period} ({config.trend_interval}), "
-        f"объем ≥ {config.volume_multiplier:g}x среднего за {config.volume_lookback} свечей\n"
+        f"EMA: 20/50/200, RSI {config.rsi_period}, ATR {config.atr_period} "
+        f"x{config.atr_multiplier:g}, объем ≥ {config.volume_multiplier:g}x "
+        f"среднего за {config.volume_lookback} свечей\n"
         f"Тейки: {config.take_profit_1_r:g}R / {config.take_profit_2_r:g}R\n"
         f"Очередь сигналов: {len(context.application.bot_data.get('pending_alerts', []))} ожидает, "
         "доставка не чаще 1 раза в 3 минуты\n"
@@ -1245,16 +1240,18 @@ async def get_market_symbols(
     config: Config,
     client: BybitClient,
 ) -> tuple[str, ...]:
-    if not config.all_usdt_perpetuals:
-        return config.symbols
-
     active_symbols = bot_data.get("active_symbols")
     refreshed_at = bot_data.get("symbols_refreshed_at", 0.0)
     if not active_symbols or time.monotonic() - refreshed_at >= SYMBOL_CACHE_SECONDS:
-        active_symbols = await client.get_active_usdt_perpetual_symbols()
+        active_symbols = await client.get_top_usdt_perpetual_symbols_by_turnover(
+            LIQUID_MARKET_LIMIT
+        )
         bot_data["active_symbols"] = active_symbols
         bot_data["symbols_refreshed_at"] = time.monotonic()
-        LOG.info("Loaded %d active USDT perpetual symbols from Bybit", len(active_symbols))
+        LOG.info("Loaded %d liquid USDT perpetual symbols from Bybit", len(active_symbols))
+    if not config.all_usdt_perpetuals:
+        active_set = set(active_symbols)
+        return tuple(symbol for symbol in config.symbols if symbol in active_set)
     return active_symbols
 
 
@@ -1377,122 +1374,42 @@ async def handle_closed_candle(application: Application, interval: str, symbol: 
         "%Y-%m-%d %H:%M:%S МСК"
     )
 
-    if interval not in {config.interval, config.ema_pullback_interval}:
+    if interval != config.ema_pullback_interval:
         return
 
     store: SignalStore = application.bot_data["store"]
     subscribers = store.subscribers()
-    if interval == config.ema_pullback_interval:
-        last_pullback_processed = store.last_strategy_processed(
-            EMA_PULLBACK_STRATEGY_NAME, symbol, interval
-        )
-        if last_pullback_processed is None or candle.timestamp > last_pullback_processed:
-            signal = build_ema_pullback_signal(
-                symbol,
-                candles,
-                atr_period=config.atr_period,
-                atr_multiplier=config.atr_multiplier,
-                take_profit_1_r=config.take_profit_1_r,
-                take_profit_2_r=config.take_profit_2_r,
-                rsi_period=config.rsi_period,
-                volume_multiplier=config.volume_multiplier,
-                volume_lookback=config.volume_lookback,
-            )
-            if signal and subscribers:
-                message = format_signal(
-                    signal, config, candles, interval=interval
-                )
-                enqueue_market_alert(
-                    application,
-                    subscribers,
-                    message,
-                    candles,
-                    symbol,
-                    interval,
-                    signal,
-                )
-            store.mark_strategy_processed(
-                EMA_PULLBACK_STRATEGY_NAME, symbol, interval, candle.timestamp
-            )
-
-    if interval != config.interval:
+    last_pullback_processed = store.last_strategy_processed(
+        EMA_PULLBACK_STRATEGY_NAME, symbol, interval
+    )
+    if last_pullback_processed is not None and candle.timestamp <= last_pullback_processed:
         return
 
-    analysis = calculate_market_analysis(candles, interval, config.rsi_period)
-    latest_rsi_state = detect_rsi_extreme(
-        [item.close for item in candles], config.rsi_period
-    )
-    previous_rsi_state = store.rsi_extreme_state(symbol, interval)
-    previous_timestamp, previous_label = (
-        previous_rsi_state if previous_rsi_state else (None, "neutral")
-    )
-    if previous_timestamp is None or candle.timestamp > previous_timestamp:
-        current_label = latest_rsi_state[0] if latest_rsi_state else "neutral"
-        if current_label != "neutral" and current_label != previous_label:
-            message = format_rsi_extreme(
-                symbol,
-                current_label,
-                latest_rsi_state[1],
-                candle.close,
-                candle.timestamp,
-                interval,
-                analysis,
-            )
-            if subscribers:
-                enqueue_market_alert(
-                    application,
-                    subscribers,
-                    message,
-                    candles,
-                    symbol,
-                    interval,
-                )
-        store.mark_rsi_extreme_processed(symbol, interval, candle.timestamp, current_label)
-
-    last_processed = store.last_processed(symbol, interval)
-    if last_processed is not None and candle.timestamp <= last_processed:
-        return
-
-    signal = build_signal(
+    signal = build_ema_pullback_signal(
         symbol,
         candles,
-        fast_period=config.fast_ema_period,
-        slow_period=config.slow_ema_period,
-        rsi_period=config.rsi_period,
         atr_period=config.atr_period,
         atr_multiplier=config.atr_multiplier,
         take_profit_1_r=config.take_profit_1_r,
         take_profit_2_r=config.take_profit_2_r,
+        rsi_period=config.rsi_period,
         volume_multiplier=config.volume_multiplier,
         volume_lookback=config.volume_lookback,
     )
-    if signal:
-        trend_candles = (
-            application.bot_data.get("candle_cache", {})
-            .get(config.trend_interval, {})
-            .get(symbol, [])
+    if signal and subscribers:
+        message = format_signal(signal, config, candles, interval=interval)
+        enqueue_market_alert(
+            application,
+            subscribers,
+            message,
+            candles,
+            symbol,
+            interval,
+            signal,
         )
-        if confirm_trend(signal, trend_candles, config.trend_ema_period):
-            message = format_signal(signal, config, candles)
-            if subscribers:
-                enqueue_market_alert(
-                    application,
-                    subscribers,
-                    message,
-                    candles,
-                    symbol,
-                    interval,
-                    signal,
-                )
-        else:
-            LOG.info(
-                "Ignored %s signal for %s: trend EMA %s on interval %s did not confirm",
-                signal.direction,
-                symbol,
-                config.trend_ema_period,
-                config.trend_interval,
-            )
-    store.mark_processed(symbol, interval, candle.timestamp)
+    store.mark_strategy_processed(
+        EMA_PULLBACK_STRATEGY_NAME, symbol, interval, candle.timestamp
+    )
 
 
 async def stream_interval(
@@ -1554,11 +1471,7 @@ async def stream_interval(
 async def run_market_streams(application: Application) -> None:
     config: Config = application.bot_data["config"]
     client: BybitClient = application.bot_data["bybit"]
-    intervals = tuple(
-        dict.fromkeys(
-            (config.interval, config.trend_interval, config.ema_pullback_interval)
-        )
-    )
+    intervals = (config.ema_pullback_interval,)
 
     while True:
         application.bot_data["market_stream_status"] = "initializing"
