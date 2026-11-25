@@ -1,0 +1,1567 @@
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import math
+import os
+import sqlite3
+import time
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+from io import BytesIO
+
+import httpx
+import matplotlib
+
+matplotlib.use("Agg")
+
+import matplotlib.dates as mdates
+import matplotlib.pyplot as plt
+import websockets
+from websockets.exceptions import WebSocketException
+from matplotlib.patches import Rectangle
+from telegram import InputFile, Update
+from telegram.error import TelegramError
+from telegram.ext import Application, ApplicationBuilder, CommandHandler, ContextTypes
+
+from strategy import (
+    Candle,
+    EMA_PULLBACK_STRATEGY_NAME,
+    Signal,
+    build_ema_pullback_signal,
+    build_signal,
+    confirm_trend,
+    detect_rsi_extreme,
+    ema,
+    rsi,
+)
+
+BYBIT_KLINE_URL = "https://api.bybit.com/v5/market/kline"
+BYBIT_INSTRUMENTS_URL = "https://api.bybit.com/v5/market/instruments-info"
+BYBIT_TICKERS_URL = "https://api.bybit.com/v5/market/tickers"
+BYBIT_LINEAR_WS_URL = "wss://stream.bybit.com/v5/public/linear"
+VALID_INTERVALS = {"1", "3", "5", "15", "30", "60", "120", "240", "360", "720", "D", "W", "M"}
+SYMBOL_CACHE_SECONDS = 60 * 60
+MAX_CONCURRENT_SYMBOL_SCANS = 8
+MAX_SUBSCRIPTION_ARGUMENT_CHARS = 18000
+WS_SYMBOL_REFRESH_SECONDS = 60 * 60
+LIQUID_MARKET_LIMIT = 150
+SIGNAL_CHART_CANDLES = 100
+SIGNAL_QUEUE_INTERVAL_SECONDS = 3 * 60
+SIGNAL_QUEUE_GATHER_SECONDS = 10
+SIGNAL_QUEUE_MIN_AGE_SECONDS = 15 * 60
+BYBIT_REQUEST_INTERVAL_SECONDS = 0.12
+BYBIT_HTTP_TIMEOUT_SECONDS = 30
+PRICE_ALERT_SCAN_SECONDS = 60
+DEFAULT_PRICE_ALERT_THRESHOLD = 5.0
+MIN_PRICE_ALERT_THRESHOLD = 0.1
+MAX_PRICE_ALERT_THRESHOLD = 1000.0
+LOG = logging.getLogger("bybit_signals")
+MOSCOW_TIMEZONE = timezone(timedelta(hours=3), name="MSK")
+
+
+@dataclass(frozen=True)
+class Config:
+    telegram_bot_token: str
+    symbols: tuple[str, ...]
+    all_usdt_perpetuals: bool
+    interval: str
+    database_path: str
+    fast_ema_period: int
+    slow_ema_period: int
+    rsi_period: int
+    atr_period: int
+    atr_multiplier: float
+    take_profit_1_r: float
+    take_profit_2_r: float
+    volume_multiplier: float
+    volume_lookback: int
+    trend_interval: str
+    trend_ema_period: int
+    ema_pullback_interval: str
+
+    @classmethod
+    def from_env(cls) -> Config:
+        token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+        if not token:
+            raise ValueError("TELEGRAM_BOT_TOKEN is required")
+
+        symbol_setting = os.environ.get("SYMBOLS", "ALL").strip()
+        all_usdt_perpetuals = symbol_setting.upper() == "ALL"
+        symbols = () if all_usdt_perpetuals else tuple(
+            dict.fromkeys(
+                symbol.strip().upper()
+                for symbol in symbol_setting.split(",")
+                if symbol.strip()
+            )
+        )
+        if not all_usdt_perpetuals and (
+            not symbols or any(not symbol.endswith("USDT") for symbol in symbols)
+        ):
+            raise ValueError("SYMBOLS must be ALL or a comma-separated list of USDT symbols")
+
+        interval = os.environ.get("INTERVAL", "15").strip().upper()
+        if interval not in VALID_INTERVALS:
+            raise ValueError(f"INTERVAL must be one of: {', '.join(sorted(VALID_INTERVALS))}")
+
+        try:
+            fast_ema = int(os.environ.get("FAST_EMA_PERIOD", "20"))
+            slow_ema = int(os.environ.get("SLOW_EMA_PERIOD", "50"))
+            rsi_period = int(os.environ.get("RSI_PERIOD", "14"))
+            atr_period = int(os.environ.get("ATR_PERIOD", "14"))
+            atr_multiplier = float(os.environ.get("ATR_MULTIPLIER", "1.5"))
+            take_profit_1_r = float(os.environ.get("TAKE_PROFIT_1_R", "1"))
+            take_profit_2_r = float(os.environ.get("TAKE_PROFIT_2_R", "2"))
+            volume_multiplier = float(os.environ.get("VOLUME_MULTIPLIER", "1.2"))
+            volume_lookback = int(os.environ.get("VOLUME_LOOKBACK", "20"))
+            trend_interval = os.environ.get("TREND_INTERVAL", "60").strip().upper()
+            trend_ema_period = int(os.environ.get("TREND_EMA_PERIOD", "200"))
+            ema_pullback_interval = os.environ.get(
+                "EMA_PULLBACK_INTERVAL", "240"
+            ).strip().upper()
+        except ValueError as error:
+            raise ValueError("Strategy periods and multipliers must be numeric") from error
+        if fast_ema < 2 or slow_ema <= fast_ema or slow_ema > 198:
+            raise ValueError(
+                "EMA periods must satisfy 2 <= FAST_EMA_PERIOD < SLOW_EMA_PERIOD <= 198"
+            )
+        if rsi_period < 2 or atr_period < 1:
+            raise ValueError("RSI_PERIOD must be at least 2 and ATR_PERIOD must be positive")
+        if trend_interval not in VALID_INTERVALS:
+            raise ValueError(f"TREND_INTERVAL must be one of: {', '.join(sorted(VALID_INTERVALS))}")
+        if ema_pullback_interval not in {"60", "240"}:
+            raise ValueError("EMA_PULLBACK_INTERVAL must be 60 or 240")
+        if not 2 <= trend_ema_period <= 500:
+            raise ValueError("TREND_EMA_PERIOD must be between 2 and 500")
+        if volume_lookback < 1 or not math.isfinite(volume_multiplier) or volume_multiplier <= 0:
+            raise ValueError("VOLUME_LOOKBACK and VOLUME_MULTIPLIER must be positive")
+        if (
+            not all(math.isfinite(value) for value in (atr_multiplier, take_profit_1_r, take_profit_2_r))
+            or atr_multiplier <= 0
+            or take_profit_1_r <= 0
+            or take_profit_2_r <= take_profit_1_r
+        ):
+            raise ValueError("Risk multipliers must be positive and TAKE_PROFIT_2_R > TAKE_PROFIT_1_R")
+
+        return cls(
+            telegram_bot_token=token,
+            symbols=symbols,
+            all_usdt_perpetuals=all_usdt_perpetuals,
+            interval=interval,
+            database_path=os.environ.get("DATABASE_PATH", "signals.sqlite3"),
+            fast_ema_period=fast_ema,
+            slow_ema_period=slow_ema,
+            rsi_period=rsi_period,
+            atr_period=atr_period,
+            atr_multiplier=atr_multiplier,
+            take_profit_1_r=take_profit_1_r,
+            take_profit_2_r=take_profit_2_r,
+            volume_multiplier=volume_multiplier,
+            volume_lookback=volume_lookback,
+            trend_interval=trend_interval,
+            trend_ema_period=trend_ema_period,
+            ema_pullback_interval=ema_pullback_interval,
+        )
+
+
+@dataclass(frozen=True)
+class PendingMarketAlert:
+    chat_ids: tuple[int, ...]
+    text: str
+    candles: tuple[Candle, ...]
+    symbol: str
+    interval: str
+    signal: Signal | None
+    priority: float
+    queued_at: float
+    expires_at: float
+    dedup_key: tuple[str, str, str, int, str]
+
+
+class SignalStore:
+    def __init__(self, path: str) -> None:
+        self.connection = sqlite3.connect(path)
+        self.connection.execute("PRAGMA journal_mode=WAL")
+        self.connection.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS subscribers (
+                chat_id INTEGER PRIMARY KEY
+            );
+            CREATE TABLE IF NOT EXISTS processed_candles (
+                symbol TEXT NOT NULL,
+                interval TEXT NOT NULL,
+                timestamp INTEGER NOT NULL,
+                PRIMARY KEY (symbol, interval)
+            );
+            CREATE TABLE IF NOT EXISTS processed_strategy_candles (
+                strategy TEXT NOT NULL,
+                symbol TEXT NOT NULL,
+                interval TEXT NOT NULL,
+                timestamp INTEGER NOT NULL,
+                PRIMARY KEY (strategy, symbol, interval)
+            );
+            CREATE TABLE IF NOT EXISTS processed_rsi_extremes (
+                symbol TEXT NOT NULL,
+                interval TEXT NOT NULL,
+                timestamp INTEGER NOT NULL,
+                state TEXT NOT NULL,
+                PRIMARY KEY (symbol, interval)
+            );
+            CREATE TABLE IF NOT EXISTS watchlist (
+                chat_id INTEGER NOT NULL,
+                symbol TEXT NOT NULL,
+                threshold REAL NOT NULL,
+                last_alert_direction TEXT,
+                PRIMARY KEY (chat_id, symbol)
+            );
+            """
+        )
+        self.connection.commit()
+
+    def subscribe(self, chat_id: int) -> None:
+        self.connection.execute(
+            "INSERT OR IGNORE INTO subscribers(chat_id) VALUES (?)", (chat_id,)
+        )
+        self.connection.commit()
+
+    def unsubscribe(self, chat_id: int) -> None:
+        self.connection.execute("DELETE FROM subscribers WHERE chat_id = ?", (chat_id,))
+        self.connection.commit()
+
+    def subscribers(self) -> list[int]:
+        rows = self.connection.execute("SELECT chat_id FROM subscribers").fetchall()
+        return [row[0] for row in rows]
+
+    def last_processed(self, symbol: str, interval: str) -> int | None:
+        row = self.connection.execute(
+            "SELECT timestamp FROM processed_candles WHERE symbol = ? AND interval = ?",
+            (symbol, interval),
+        ).fetchone()
+        return row[0] if row else None
+
+    def mark_processed(self, symbol: str, interval: str, timestamp: int) -> None:
+        self.connection.execute(
+            """
+            INSERT INTO processed_candles(symbol, interval, timestamp) VALUES (?, ?, ?)
+            ON CONFLICT(symbol, interval) DO UPDATE SET timestamp = excluded.timestamp
+            """,
+            (symbol, interval, timestamp),
+        )
+        self.connection.commit()
+
+    def last_strategy_processed(
+        self, strategy: str, symbol: str, interval: str
+    ) -> int | None:
+        row = self.connection.execute(
+            """
+            SELECT timestamp FROM processed_strategy_candles
+            WHERE strategy = ? AND symbol = ? AND interval = ?
+            """,
+            (strategy, symbol, interval),
+        ).fetchone()
+        return row[0] if row else None
+
+    def mark_strategy_processed(
+        self, strategy: str, symbol: str, interval: str, timestamp: int
+    ) -> None:
+        self.connection.execute(
+            """
+            INSERT INTO processed_strategy_candles(strategy, symbol, interval, timestamp)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(strategy, symbol, interval) DO UPDATE SET timestamp = excluded.timestamp
+            """,
+            (strategy, symbol, interval, timestamp),
+        )
+        self.connection.commit()
+
+    def rsi_extreme_state(self, symbol: str, interval: str) -> tuple[int, str] | None:
+        row = self.connection.execute(
+            """
+            SELECT timestamp, state FROM processed_rsi_extremes
+            WHERE symbol = ? AND interval = ?
+            """,
+            (symbol, interval),
+        ).fetchone()
+        return (row[0], row[1]) if row else None
+
+    def mark_rsi_extreme_processed(
+        self, symbol: str, interval: str, timestamp: int, state: str
+    ) -> None:
+        self.connection.execute(
+            """
+            INSERT INTO processed_rsi_extremes(symbol, interval, timestamp, state)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(symbol, interval) DO UPDATE SET
+                timestamp = excluded.timestamp,
+                state = excluded.state
+            """,
+            (symbol, interval, timestamp, state),
+        )
+        self.connection.commit()
+
+    def watch(self, chat_id: int, symbol: str, threshold: float) -> None:
+        self.connection.execute(
+            """
+            INSERT INTO watchlist(chat_id, symbol, threshold, last_alert_direction)
+            VALUES (?, ?, ?, NULL)
+            ON CONFLICT(chat_id, symbol) DO UPDATE SET
+                threshold = excluded.threshold,
+                last_alert_direction = NULL
+            """,
+            (chat_id, symbol, threshold),
+        )
+        self.connection.commit()
+
+    def unwatch(self, chat_id: int, symbol: str) -> bool:
+        cursor = self.connection.execute(
+            "DELETE FROM watchlist WHERE chat_id = ? AND symbol = ?", (chat_id, symbol)
+        )
+        self.connection.commit()
+        return cursor.rowcount > 0
+
+    def watchlist(self, chat_id: int) -> list[tuple[str, float]]:
+        rows = self.connection.execute(
+            "SELECT symbol, threshold FROM watchlist WHERE chat_id = ? ORDER BY symbol",
+            (chat_id,),
+        ).fetchall()
+        return [(row[0], row[1]) for row in rows]
+
+    def watched_symbols(self) -> list[tuple[int, str, float, str | None]]:
+        rows = self.connection.execute(
+            """
+            SELECT watchlist.chat_id, watchlist.symbol, watchlist.threshold,
+                   watchlist.last_alert_direction
+            FROM watchlist
+            JOIN subscribers ON subscribers.chat_id = watchlist.chat_id
+            ORDER BY watchlist.chat_id, watchlist.symbol
+            """
+        ).fetchall()
+        return [(row[0], row[1], row[2], row[3]) for row in rows]
+
+    def set_watch_alert_direction(
+        self, chat_id: int, symbol: str, direction: str | None
+    ) -> None:
+        self.connection.execute(
+            "UPDATE watchlist SET last_alert_direction = ? WHERE chat_id = ? AND symbol = ?",
+            (direction, chat_id, symbol),
+        )
+        self.connection.commit()
+
+    def close(self) -> None:
+        self.connection.close()
+
+
+class BybitClient:
+    def __init__(self, client: httpx.AsyncClient) -> None:
+        self.client = client
+        self._request_lock: asyncio.Lock | None = None
+        self._last_request_at = 0.0
+
+    async def get_active_usdt_perpetual_symbols(self) -> tuple[str, ...]:
+        symbols = set()
+        cursor = None
+        seen_cursors = set()
+
+        while True:
+            params = {"category": "linear", "limit": 1000}
+            if cursor:
+                params["cursor"] = cursor
+            payload = await self._get_payload(BYBIT_INSTRUMENTS_URL, params)
+            result = payload.get("result")
+            if not isinstance(result, dict) or not isinstance(result.get("list"), list):
+                raise RuntimeError("Bybit returned malformed instruments data")
+
+            for instrument in result["list"]:
+                if not isinstance(instrument, dict):
+                    raise RuntimeError("Bybit returned malformed instrument data")
+                symbol = instrument.get("symbol")
+                if (
+                    instrument.get("status") == "Trading"
+                    and instrument.get("contractType") == "LinearPerpetual"
+                    and instrument.get("settleCoin") == "USDT"
+                    and isinstance(symbol, str)
+                    and symbol.endswith("USDT")
+                ):
+                    symbols.add(symbol)
+
+            next_cursor = result.get("nextPageCursor")
+            if not next_cursor:
+                break
+            if not isinstance(next_cursor, str):
+                raise RuntimeError("Bybit returned an invalid instruments cursor")
+            if next_cursor in seen_cursors:
+                raise RuntimeError("Bybit returned a repeated instruments cursor")
+            seen_cursors.add(next_cursor)
+            cursor = next_cursor
+
+        if not symbols:
+            raise RuntimeError("Bybit returned no active USDT perpetual contracts")
+        return tuple(sorted(symbols))
+
+    async def get_top_usdt_perpetual_symbols_by_turnover(
+        self, limit: int
+    ) -> tuple[str, ...]:
+        if limit < 1:
+            raise ValueError("limit must be positive")
+        active_symbols = set(await self.get_active_usdt_perpetual_symbols())
+        payload = await self._get_payload(BYBIT_TICKERS_URL, {"category": "linear"})
+        result = payload.get("result")
+        if not isinstance(result, dict) or not isinstance(result.get("list"), list):
+            raise RuntimeError("Bybit returned malformed ticker data")
+
+        turnover_by_symbol = {}
+        for ticker in result["list"]:
+            if not isinstance(ticker, dict):
+                raise RuntimeError("Bybit returned malformed ticker data")
+            symbol = ticker.get("symbol")
+            if symbol not in active_symbols:
+                continue
+            try:
+                turnover = float(ticker["turnover24h"])
+            except (KeyError, TypeError, ValueError) as error:
+                raise RuntimeError(f"Bybit returned malformed ticker data for {symbol}") from error
+            if math.isfinite(turnover) and turnover >= 0:
+                turnover_by_symbol[symbol] = turnover
+        if not turnover_by_symbol:
+            raise RuntimeError("Bybit returned no active USDT perpetual tickers")
+        return tuple(
+            symbol
+            for symbol, _ in sorted(
+                turnover_by_symbol.items(), key=lambda item: item[1], reverse=True
+            )[:limit]
+        )
+
+    async def get_closed_candles(
+        self, symbol: str, interval: str, limit: int = 200
+    ) -> list[Candle]:
+        payload = await self._get_payload(
+            BYBIT_KLINE_URL,
+            {"category": "linear", "symbol": symbol, "interval": interval, "limit": limit},
+        )
+        result = payload.get("result")
+        if not isinstance(result, dict) or not isinstance(result.get("list"), list):
+            raise RuntimeError(f"Bybit returned malformed kline data for {symbol}")
+        rows = result["list"]
+        if len(rows) < 3:
+            return []
+
+        # Bybit returns newest first; drop the still-forming candle and restore chronological order.
+        closed_rows = reversed(rows[1:])
+        try:
+            return [
+                Candle(
+                    timestamp=int(row[0]),
+                    open=float(row[1]),
+                    high=float(row[2]),
+                    low=float(row[3]),
+                    close=float(row[4]),
+                    volume=float(row[5]),
+                )
+                for row in closed_rows
+            ]
+        except (IndexError, TypeError, ValueError) as error:
+            raise RuntimeError(f"Bybit returned malformed kline data for {symbol}") from error
+
+    async def get_historical_candles(
+        self, symbol: str, interval: str, start_ms: int, end_ms: int, limit: int = 1000
+    ) -> list[Candle]:
+        payload = await self._get_payload(
+            BYBIT_KLINE_URL,
+            {
+                "category": "linear",
+                "symbol": symbol,
+                "interval": interval,
+                "start": start_ms,
+                "end": end_ms,
+                "limit": min(max(limit, 1), 1000),
+            },
+        )
+        result = payload.get("result")
+        if not isinstance(result, dict) or not isinstance(result.get("list"), list):
+            raise RuntimeError(f"Bybit returned malformed historical data for {symbol}")
+        try:
+            return [
+                Candle(
+                    timestamp=int(row[0]),
+                    open=float(row[1]),
+                    high=float(row[2]),
+                    low=float(row[3]),
+                    close=float(row[4]),
+                    volume=float(row[5]),
+                )
+                for row in result["list"]
+            ]
+        except (IndexError, TypeError, ValueError) as error:
+            raise RuntimeError(f"Bybit returned malformed historical data for {symbol}") from error
+
+    async def get_tickers(self, symbols: set[str]) -> dict[str, tuple[float, float]]:
+        if not symbols:
+            return {}
+        payload = await self._get_payload(BYBIT_TICKERS_URL, {"category": "linear"})
+        result = payload.get("result")
+        if not isinstance(result, dict) or not isinstance(result.get("list"), list):
+            raise RuntimeError("Bybit returned malformed ticker data")
+
+        tickers = {}
+        for ticker in result["list"]:
+            if not isinstance(ticker, dict):
+                raise RuntimeError("Bybit returned malformed ticker data")
+            symbol = ticker.get("symbol")
+            if symbol not in symbols:
+                continue
+            try:
+                last_price = float(ticker["lastPrice"])
+                change_24h_pct = float(ticker["price24hPcnt"]) * 100
+            except (KeyError, TypeError, ValueError) as error:
+                raise RuntimeError(f"Bybit returned malformed ticker data for {symbol}") from error
+            if not math.isfinite(last_price) or not math.isfinite(change_24h_pct):
+                raise RuntimeError(f"Bybit returned invalid ticker values for {symbol}")
+            tickers[symbol] = (last_price, change_24h_pct)
+        return tickers
+
+    async def _get_payload(self, url: str, params: dict[str, str | int]) -> dict:
+        if self._request_lock is None:
+            self._request_lock = asyncio.Lock()
+        last_error: Exception | None = None
+        for attempt in range(5):
+            async with self._request_lock:
+                now = asyncio.get_running_loop().time()
+                delay = BYBIT_REQUEST_INTERVAL_SECONDS - (now - self._last_request_at)
+                if delay > 0:
+                    await asyncio.sleep(delay)
+                self._last_request_at = asyncio.get_running_loop().time()
+
+            try:
+                response = await self.client.get(url, params=params)
+                response.raise_for_status()
+                payload = response.json()
+            except httpx.HTTPStatusError as error:
+                if error.response.status_code != 429 or attempt == 4:
+                    raise
+                await asyncio.sleep(2**attempt)
+                continue
+            except httpx.TransportError as error:
+                last_error = error
+                if attempt == 4:
+                    raise
+                await asyncio.sleep(1 + attempt)
+                continue
+            if isinstance(payload, dict) and payload.get("retCode") == 10006:
+                if attempt == 4:
+                    raise RuntimeError(
+                        f"Bybit returned retCode=10006: {payload.get('retMsg')}"
+                    )
+                await asyncio.sleep(2**attempt)
+                continue
+            break
+        else:
+            raise RuntimeError("Bybit request failed") from last_error
+        if not isinstance(payload, dict) or payload.get("retCode") != 0:
+            code = payload.get("retCode") if isinstance(payload, dict) else "unknown"
+            message = payload.get("retMsg") if isinstance(payload, dict) else "invalid response"
+            raise RuntimeError(f"Bybit returned retCode={code}: {message}")
+        return payload
+
+
+def format_interval_label(interval: str) -> str:
+    return {
+        "60": "1ч",
+        "120": "2ч",
+        "240": "4ч",
+        "D": "1д",
+        "W": "1н",
+        "M": "1м",
+    }.get(interval, f"{interval}м")
+
+
+def format_signal(
+    signal: Signal,
+    config: Config,
+    candles: list[Candle] | None = None,
+    interval: str | None = None,
+) -> str:
+    direction_emoji = "🟢" if signal.direction == "LONG" else "🔴"
+    opened_at = datetime.fromtimestamp(signal.timestamp / 1000, tz=MOSCOW_TIMEZONE)
+    signal_interval = interval or config.interval
+    interval_label = format_interval_label(signal_interval)
+    strategy_details = (
+        "Тренд: цена и EMA20/50/200 выстроены по направлению сделки; "
+        "откат к EMA20/50 подтвержден поглощением или пин-баром."
+        if signal.strategy == EMA_PULLBACK_STRATEGY_NAME
+        else (
+            f"EMA {config.fast_ema_period}/{config.slow_ema_period} + RSI {config.rsi_period}; "
+            f"подтверждены EMA {config.trend_ema_period} на {config.trend_interval} "
+            f"и объемом ≥{config.volume_multiplier:g}x среднего."
+        )
+    )
+    message = (
+        f"🚨 СИГНАЛ • {signal.direction} {direction_emoji}\n"
+        f"🏷 Стратегия: {signal.strategy}"
+        + (" • ОТДЕЛЬНАЯ КОНФЛЮЕНС-СТРАТЕГИЯ" if signal.strategy == EMA_PULLBACK_STRATEGY_NAME else " • БАЗОВАЯ EMA-СТРАТЕГИЯ")
+        + "\n"
+        f"#{signal.symbol} · Bybit Perpetual · {interval_label}\n"
+        f"Время свечи: {opened_at:%Y-%m-%d %H:%M} МСК\n\n"
+        f"💰 Вход: {format_price(signal.entry)}\n"
+        f"🎯 Тейк 1: {format_price(signal.take_profit_1)} "
+        f"({price_change(signal.entry, signal.take_profit_1, signal.direction):+.2f}%)\n"
+        f"🎯 Тейк 2: {format_price(signal.take_profit_2)} "
+        f"({price_change(signal.entry, signal.take_profit_2, signal.direction):+.2f}%)\n"
+        f"🛑 Стоп: {format_price(signal.stop_loss)} "
+        f"({price_change(signal.entry, signal.stop_loss, signal.direction):+.2f}%)\n\n"
+        f"{strategy_details} Уровни рассчитаны по ATR {config.atr_period}.\n"
+        "Только аналитическая информация: бот не торгует и не является финансовой рекомендацией."
+    )
+    if candles:
+        message += "\n\n" + format_market_analysis(
+            calculate_market_analysis(candles, signal_interval, config.rsi_period)
+        )
+    return message
+
+
+def interval_minutes(interval: str) -> int:
+    if interval == "D":
+        return 24 * 60
+    if interval == "W":
+        return 7 * 24 * 60
+    if interval == "M":
+        return 30 * 24 * 60
+    return int(interval)
+
+
+def calculate_market_analysis(
+    candles: list[Candle], interval: str, rsi_period: int
+) -> dict[str, float | None]:
+    closes = [candle.close for candle in candles]
+    current_price = closes[-1]
+    lookback_bars = max(1, round(24 * 60 / interval_minutes(interval)))
+    price_change_24h = None
+    if len(closes) > lookback_bars:
+        reference_price = closes[-lookback_bars - 1]
+        if reference_price > 0:
+            price_change_24h = (current_price - reference_price) / reference_price * 100
+    change_period_hours = lookback_bars * interval_minutes(interval) / 60
+
+    rsi_values = rsi(closes, rsi_period)
+    ma50_values = ema(closes, 50)
+    rsi_value = rsi_values[-1] if rsi_values else None
+    ma50_value = ma50_values[-1] if ma50_values else None
+    ma50_difference = (
+        (current_price - ma50_value) / ma50_value * 100
+        if ma50_value is not None and ma50_value > 0
+        else None
+    )
+    return {
+        "current_price": current_price,
+        "change_24h_pct": price_change_24h,
+        "change_period_hours": change_period_hours,
+        "rsi": rsi_value,
+        "ma50": ma50_value,
+        "ma50_difference_pct": ma50_difference,
+    }
+
+
+def format_market_analysis(analysis: dict[str, float | None]) -> str:
+    change = analysis["change_24h_pct"]
+    rsi_value = analysis["rsi"]
+    ma50 = analysis["ma50"]
+    ma50_difference = analysis["ma50_difference_pct"]
+    change_period_hours = analysis["change_period_hours"]
+    change_period = (
+        "24ч"
+        if change_period_hours is not None and abs(change_period_hours - 24) < 0.01
+        else f"{change_period_hours:g}ч"
+        if change_period_hours is not None
+        else "24ч"
+    )
+    change_text = (
+        f"{change:+.2f}%"
+        if change is not None
+        else "недостаточно истории"
+    )
+    rsi_text = f"{rsi_value:.1f}" if rsi_value is not None else "недостаточно данных"
+    ma50_text = (
+        f"{format_price(ma50)} ({ma50_difference:+.2f}%)"
+        if ma50 is not None and ma50_difference is not None
+        else "недостаточно данных"
+    )
+    return (
+        f"📊 Анализ закрытых свечей: цена {format_price(analysis['current_price'])} USDT; "
+        f"изменение за {change_period} {change_text}; RSI {rsi_text}; "
+        f"отклонение от MA50 {ma50_text}."
+    )
+
+
+def render_market_chart(
+    candles: list[Candle],
+    symbol: str,
+    interval: str,
+    signal: Signal | None = None,
+) -> BytesIO:
+    chart_candles = candles[-SIGNAL_CHART_CANDLES:]
+    if len(chart_candles) < 2:
+        raise ValueError("At least two candles are required to render the signal chart")
+
+    timestamps = [
+        datetime.fromtimestamp(candle.timestamp / 1000, tz=timezone.utc)
+        for candle in chart_candles
+    ]
+    x_values = mdates.date2num(timestamps)
+    spacing = (
+        x_values[-1] - x_values[-2]
+        if x_values[-1] > x_values[-2]
+        else interval_minutes(interval) / (24 * 60)
+    )
+    figure, axis = plt.subplots(figsize=(12, 6), facecolor="#10121b")
+    axis.set_facecolor("#10121b")
+    for x_value, candle in zip(x_values, chart_candles):
+        rising = candle.close >= candle.open
+        color = "#35c98a" if rising else "#ef5364"
+        axis.vlines(x_value, candle.low, candle.high, color=color, linewidth=1)
+        body_bottom = min(candle.open, candle.close)
+        body_height = max(abs(candle.close - candle.open), abs(candle.close) * 0.00001)
+        axis.add_patch(
+            Rectangle(
+                (x_value - spacing * 0.32, body_bottom),
+                spacing * 0.64,
+                body_height,
+                facecolor=color,
+                edgecolor=color,
+                linewidth=0.6,
+            )
+        )
+
+    ma_values = ema([candle.close for candle in chart_candles], 50)
+    if ma_values:
+        axis.plot(
+            x_values[-len(ma_values):],
+            ma_values,
+            color="#f0b34a",
+            linewidth=1.2,
+            label="MA50",
+        )
+
+    levels = (
+        (
+            ("Вход", signal.entry, "#f5f5f5"),
+            ("TP1", signal.take_profit_1, "#35c98a"),
+            ("TP2", signal.take_profit_2, "#5c9cff"),
+            ("Стоп", signal.stop_loss, "#ef5364"),
+        )
+        if signal
+        else ()
+    )
+    for label, price, color in levels:
+        axis.axhline(price, color=color, linestyle="--", linewidth=1)
+        axis.text(
+            x_values[-1] + spacing * 1.5,
+            price,
+            f"{label} {format_price(price)}",
+            color=color,
+            va="center",
+            ha="left",
+            fontsize=8,
+        )
+
+    heading = f"{signal.direction} сигнал" if signal else "Анализ рынка"
+    axis.set_title(
+        f"{symbol} · {heading} · Bybit Perpetual · {interval}",
+        color="white",
+        loc="left",
+        fontsize=13,
+    )
+    axis.xaxis.set_major_formatter(
+        mdates.DateFormatter("%d.%m %H:%M", tz=MOSCOW_TIMEZONE)
+    )
+    axis.tick_params(colors="#b9bdc9", labelsize=8)
+    axis.grid(color="#343746", alpha=0.55, linewidth=0.6)
+    for spine in axis.spines.values():
+        spine.set_color("#424657")
+    axis.set_xlim(x_values[0] - spacing, x_values[-1] + spacing * 12)
+    figure.autofmt_xdate()
+    figure.tight_layout()
+    image = BytesIO()
+    figure.savefig(image, format="png", dpi=140, facecolor=figure.get_facecolor())
+    plt.close(figure)
+    image.seek(0)
+    return image
+
+
+def format_rsi_extreme(
+    symbol: str,
+    state: str,
+    rsi_value: float,
+    close: float,
+    timestamp: int,
+    interval: str,
+    analysis: dict[str, float | None] | None = None,
+) -> str:
+    opened_at = datetime.fromtimestamp(timestamp / 1000, tz=MOSCOW_TIMEZONE)
+    interval_label = {"D": "1д", "W": "1н", "M": "1м"}.get(interval, f"{interval}м")
+    if state == "overbought":
+        heading = "ПЕРЕКУПЛЕННОСТЬ"
+        note = "Возможен откат вниз, но разворот не гарантирован."
+        emoji = "🔥"
+    else:
+        heading = "ПЕРЕПРОДАННОСТЬ"
+        note = "Возможен отскок вверх, но разворот не гарантирован."
+        emoji = "🧊"
+    message = (
+        f"{emoji} RSI-СИГНАЛ • {heading}\n"
+        f"#{symbol} · Bybit Perpetual · {interval_label}\n"
+        f"RSI {rsi_value:.1f} · Цена закрытия свечи: {format_price(close)} USDT\n"
+        f"Время свечи: {opened_at:%Y-%m-%d %H:%M} МСК\n\n"
+        f"{note}\n"
+        "Это индикаторное предупреждение, а не рекомендация открывать сделку."
+    )
+    if analysis:
+        message += "\n\n" + format_market_analysis(analysis)
+    return message
+
+
+async def broadcast_market_photo(
+    application: Application,
+    chat_ids: list[int],
+    text: str,
+    candles: list[Candle],
+    symbol: str,
+    interval: str,
+    signal: Signal | None = None,
+) -> None:
+    image = render_market_chart(candles, symbol, interval, signal).getvalue()
+    for chat_id in chat_ids:
+        try:
+            await application.bot.send_photo(
+                chat_id=chat_id,
+                photo=InputFile(image, filename=f"{symbol.lower()}-analysis.png"),
+                caption=text,
+            )
+        except TelegramError:
+            LOG.exception("Failed to deliver market chart for %s to chat %s", symbol, chat_id)
+
+
+def signal_priority_score(
+    signal: Signal, candles: list[Candle], config: Config
+) -> float:
+    if len(candles) <= config.volume_lookback:
+        return 0
+    average_volume = (
+        sum(candle.volume for candle in candles[-config.volume_lookback - 1 : -1])
+        / config.volume_lookback
+    )
+    if average_volume <= 0:
+        return 0
+    volume_ratio = candles[-1].volume / average_volume
+    rsi_values = rsi([candle.close for candle in candles], config.rsi_period)
+    if not rsi_values:
+        return volume_ratio
+    preferred_rsi = 60 if signal.direction == "LONG" else 40
+    rsi_alignment = 1 - min(abs(rsi_values[-1] - preferred_rsi) / 20, 1)
+    return volume_ratio + rsi_alignment
+
+
+def enqueue_market_alert(
+    application: Application,
+    chat_ids: list[int],
+    text: str,
+    candles: list[Candle],
+    symbol: str,
+    interval: str,
+    signal: Signal | None = None,
+) -> None:
+    if not chat_ids:
+        return
+    kind = "signal" if signal else "rsi"
+    timestamp = signal.timestamp if signal else candles[-1].timestamp
+    dedup_key = (
+        kind,
+        symbol,
+        interval,
+        timestamp,
+        signal.strategy if signal else "",
+    )
+    queued_keys: set[tuple[str, str, str, int, str]] = application.bot_data[
+        "queued_alert_keys"
+    ]
+    if dedup_key in queued_keys:
+        return
+
+    now = asyncio.get_running_loop().time()
+    ttl = max(
+        SIGNAL_QUEUE_MIN_AGE_SECONDS,
+        interval_minutes(interval) * 60,
+    )
+    alert = PendingMarketAlert(
+        chat_ids=tuple(chat_ids),
+        text=text,
+        candles=tuple(candles),
+        symbol=symbol,
+        interval=interval,
+        signal=signal,
+        priority=signal_priority_score(signal, candles, application.bot_data["config"])
+        if signal
+        else 0,
+        queued_at=now,
+        expires_at=now + ttl,
+        dedup_key=dedup_key,
+    )
+    application.bot_data["pending_alerts"].append(alert)
+    queued_keys.add(dedup_key)
+    application.bot_data["signal_queue_event"].set()
+    LOG.info(
+        "Queued %s alert for %s with priority %.2f (%d waiting)",
+        kind,
+        symbol,
+        alert.priority,
+        len(application.bot_data["pending_alerts"]),
+    )
+
+
+async def run_signal_dispatcher(application: Application) -> None:
+    pending: list[PendingMarketAlert] = application.bot_data["pending_alerts"]
+    queued_keys: set[tuple[str, str, str, int, str]] = application.bot_data[
+        "queued_alert_keys"
+    ]
+    queue_event: asyncio.Event = application.bot_data["signal_queue_event"]
+    loop = asyncio.get_running_loop()
+    next_send_at = loop.time()
+
+    while True:
+        now = loop.time()
+        retained = []
+        for alert in pending:
+            if alert.expires_at <= now:
+                queued_keys.discard(alert.dedup_key)
+                LOG.info(
+                    "Dropped stale queued alert for %s (%s)",
+                    alert.symbol,
+                    alert.interval,
+                )
+            else:
+                retained.append(alert)
+        pending[:] = retained
+
+        if not pending:
+            queue_event.clear()
+            await queue_event.wait()
+            continue
+
+        first_alert_at = min(alert.queued_at for alert in pending)
+        gather_until = first_alert_at + SIGNAL_QUEUE_GATHER_SECONDS
+        ready_at = max(gather_until, next_send_at)
+        delay = ready_at - now
+        if delay > 0:
+            queue_event.clear()
+            try:
+                await asyncio.wait_for(queue_event.wait(), timeout=delay)
+            except asyncio.TimeoutError:
+                pass
+            continue
+
+        alert = max(
+            pending,
+            key=lambda item: (item.priority, -item.queued_at, item.symbol),
+        )
+        pending.remove(alert)
+        queued_keys.discard(alert.dedup_key)
+        store: SignalStore = application.bot_data["store"]
+        active_chat_ids = set(store.subscribers())
+        chat_ids = [chat_id for chat_id in alert.chat_ids if chat_id in active_chat_ids]
+        if not chat_ids:
+            LOG.info("Skipped queued alert for %s: no active subscribers", alert.symbol)
+            continue
+        await broadcast_market_photo(
+            application,
+            chat_ids,
+            alert.text,
+            list(alert.candles),
+            alert.symbol,
+            alert.interval,
+            alert.signal,
+        )
+        next_send_at = loop.time() + SIGNAL_QUEUE_INTERVAL_SECONDS
+
+
+def format_price(price: float) -> str:
+    return f"{price:.2f}" if price >= 100 else f"{price:.4f}" if price >= 1 else f"{price:.8f}".rstrip("0")
+
+
+def price_change(entry: float, level: float, direction: str) -> float:
+    change = (level - entry) / entry * 100
+    return change if direction == "LONG" else -change
+
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.effective_chat is None or update.message is None:
+        return
+    store: SignalStore = context.application.bot_data["store"]
+    store.subscribe(update.effective_chat.id)
+    await update.message.reply_text(
+        "Подписка включена. Я отслеживаю публичные свечи Bybit и отправляю технические сигналы "
+        "только по отдельной стратегии EMA PULLBACK 20/50/200 CONFLUENCE, "
+        "по одному, не чаще одного раза в 3 минуты.\n"
+        "Команды: /status, /symbols, /watch, /watchlist, /unwatch, /stop, /help."
+    )
+
+
+async def stop(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.effective_chat is None or update.message is None:
+        return
+    store: SignalStore = context.application.bot_data["store"]
+    store.unsubscribe(update.effective_chat.id)
+    await update.message.reply_text("Подписка отключена. Для возобновления отправьте /start.")
+
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.message:
+        await update.message.reply_text(
+            "Я отслеживаю публичные USDT perpetual-контракты Bybit и отправляю только "
+            "сигнал EMA PULLBACK 20/50/200 CONFLUENCE: направление по выстроенным EMA 20/50/200, "
+            "откат к EMA20/50, подтверждение поглощением или пин-баром, а также RSI и объем "
+            f"на {format_interval_label(context.application.bot_data['config'].ema_pullback_interval)}.\n"
+            "Я не принимаю ордера и не использую ключи биржи.\n\n"
+            "/start — подписаться\n/status — состояние бота\n/symbols — список рынков\n"
+            "/watch BTCUSDT [5] — следить за монетой и задать порог изменения за 24 часа в %\n"
+            "/watchlist — мой список отслеживания\n/unwatch BTCUSDT — удалить монету из списка\n"
+            "/stop — отписаться от всех сообщений"
+        )
+
+
+async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.message is None:
+        return
+    config: Config = context.application.bot_data["config"]
+    last_event = context.application.bot_data.get(
+        "last_market_event_at", "закрытых свечей пока не получено"
+    )
+    stream_status = context.application.bot_data.get("market_stream_status", "initializing")
+    active_symbols = context.application.bot_data.get("active_symbols", ())
+    markets = (
+        f"Все активные USDT perpetual Bybit ({len(active_symbols)} рынков)"
+        if config.all_usdt_perpetuals and active_symbols
+        else "Все активные USDT perpetual Bybit (список загружается)"
+        if config.all_usdt_perpetuals
+        else f"{len(config.symbols)} рынков: {', '.join(config.symbols)}"
+    )
+    await update.message.reply_text(
+        f"Режим: сигналы без торговли\n"
+        f"Рынки: {markets}\n"
+        f"Таймфрейм: {format_interval_label(config.ema_pullback_interval)}\n"
+        f"Дополнительная стратегия: EMA PULLBACK 20/50/200 CONFLUENCE на "
+        f"{format_interval_label(config.ema_pullback_interval)}\n"
+        f"EMA: 20/50/200, RSI {config.rsi_period}, ATR {config.atr_period} "
+        f"x{config.atr_multiplier:g}, объем ≥ {config.volume_multiplier:g}x "
+        f"среднего за {config.volume_lookback} свечей\n"
+        f"Тейки: {config.take_profit_1_r:g}R / {config.take_profit_2_r:g}R\n"
+        f"Очередь сигналов: {len(context.application.bot_data.get('pending_alerts', []))} ожидает, "
+        "доставка не чаще 1 раза в 3 минуты\n"
+        f"Поток Bybit: {stream_status}\n"
+        f"Последняя закрытая свеча: {last_event}"
+    )
+
+
+async def symbols(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.message is None:
+        return
+    config: Config = context.application.bot_data["config"]
+    active_symbols = context.application.bot_data.get("active_symbols", ())
+    if config.all_usdt_perpetuals:
+        if not active_symbols:
+            await update.message.reply_text(
+                "Список активных USDT perpetual-контрактов Bybit загружается при запуске потока."
+            )
+            return
+        symbols_preview = ", ".join(active_symbols[:30])
+        extra_count = len(active_symbols) - min(30, len(active_symbols))
+        suffix = f" и еще {extra_count}" if extra_count else ""
+        await update.message.reply_text(
+            f"Отслеживаю {len(active_symbols)} активных USDT perpetual-контрактов.\n"
+            f"Примеры: {symbols_preview}{suffix}\nТаймфрейм: {config.interval}"
+        )
+        return
+    await update.message.reply_text(
+        f"Отслеживаемые рынки: {', '.join(config.symbols)}\nТаймфрейм: {config.interval}"
+    )
+
+
+async def watch(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.effective_chat is None or update.message is None:
+        return
+    if not context.args or len(context.args) > 2:
+        await update.message.reply_text(
+            f"Формат: /watch BTCUSDT [порог_в_%]. По умолчанию порог "
+            f"{DEFAULT_PRICE_ALERT_THRESHOLD:g}% за 24 часа."
+        )
+        return
+
+    symbol = context.args[0].strip().upper()
+    if not symbol.endswith("USDT") or not symbol[:-4].isalnum():
+        await update.message.reply_text("Укажите символ USDT perpetual, например /watch BTCUSDT 5")
+        return
+    try:
+        threshold = (
+            float(context.args[1])
+            if len(context.args) == 2
+            else DEFAULT_PRICE_ALERT_THRESHOLD
+        )
+    except ValueError:
+        await update.message.reply_text("Порог должен быть числом, например /watch BTCUSDT 5")
+        return
+    if (
+        not math.isfinite(threshold)
+        or not MIN_PRICE_ALERT_THRESHOLD <= threshold <= MAX_PRICE_ALERT_THRESHOLD
+    ):
+        await update.message.reply_text(
+            f"Порог должен быть от {MIN_PRICE_ALERT_THRESHOLD:g}% до "
+            f"{MAX_PRICE_ALERT_THRESHOLD:g}%."
+        )
+        return
+
+    client: BybitClient = context.application.bot_data["bybit"]
+    try:
+        ticker = await client.get_tickers({symbol})
+    except (httpx.HTTPError, RuntimeError) as error:
+        LOG.warning("Could not validate watch symbol %s: %s", symbol, error)
+        await update.message.reply_text("Не удалось проверить Bybit. Попробуйте позже.")
+        return
+    if symbol not in ticker:
+        await update.message.reply_text(
+            f"Не нашел активный USDT perpetual-контракт {symbol} на Bybit."
+        )
+        return
+
+    store: SignalStore = context.application.bot_data["store"]
+    store.subscribe(update.effective_chat.id)
+    store.watch(update.effective_chat.id, symbol, threshold)
+    await update.message.reply_text(
+        f"Добавил {symbol} в ваш список. Уведомлю, когда изменение за 24 часа "
+        f"достигнет +{threshold:g}% или -{threshold:g}%.\n"
+        f"Текущая цена: {format_price(ticker[symbol][0])} USDT."
+    )
+
+
+async def unwatch(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.effective_chat is None or update.message is None:
+        return
+    if len(context.args) != 1:
+        await update.message.reply_text("Формат: /unwatch BTCUSDT")
+        return
+    symbol = context.args[0].strip().upper()
+    store: SignalStore = context.application.bot_data["store"]
+    if store.unwatch(update.effective_chat.id, symbol):
+        await update.message.reply_text(f"{symbol} удалена из вашего списка.")
+    else:
+        await update.message.reply_text(f"{symbol} нет в вашем списке отслеживания.")
+
+
+async def watchlist_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.effective_chat is None or update.message is None:
+        return
+    store: SignalStore = context.application.bot_data["store"]
+    entries = store.watchlist(update.effective_chat.id)
+    if not entries:
+        await update.message.reply_text(
+            "Ваш список пуст. Добавьте монету командой /watch BTCUSDT [порог_в_%]."
+        )
+        return
+    lines = [
+        f"{symbol} — уведомление при изменении за 24 ч. ±{threshold:g}%"
+        for symbol, threshold in entries
+    ]
+    await update.message.reply_text("Ваш список отслеживания:\n" + "\n".join(lines))
+
+
+def evaluate_price_alert(
+    change_24h_pct: float, threshold: float, last_direction: str | None
+) -> tuple[str | None, str | None]:
+    if last_direction and abs(change_24h_pct) < threshold * 0.8:
+        last_direction = None
+
+    direction = (
+        "up" if change_24h_pct >= threshold
+        else "down" if change_24h_pct <= -threshold
+        else None
+    )
+    if direction == last_direction:
+        return None, last_direction
+    if direction is not None:
+        return direction, direction
+    return None, last_direction
+
+
+async def check_price_alerts(context: ContextTypes.DEFAULT_TYPE) -> None:
+    store: SignalStore = context.application.bot_data["store"]
+    client: BybitClient = context.application.bot_data["bybit"]
+    entries = store.watched_symbols()
+    if not entries:
+        return
+
+    symbols_to_check = {symbol for _, symbol, _, _ in entries}
+    try:
+        tickers = await client.get_tickers(symbols_to_check)
+    except (httpx.HTTPError, RuntimeError):
+        LOG.exception("Failed to fetch ticker prices for watchlists")
+        return
+
+    for chat_id, symbol, threshold, last_direction in entries:
+        ticker = tickers.get(symbol)
+        if ticker is None:
+            LOG.warning("Ticker not returned for watched symbol %s", symbol)
+            continue
+        last_price, change_24h_pct = ticker
+        direction, next_state = evaluate_price_alert(
+            change_24h_pct, threshold, last_direction
+        )
+        if direction is None and next_state != last_direction:
+            store.set_watch_alert_direction(chat_id, symbol, next_state)
+        if direction is None:
+            continue
+
+        movement = "выросла" if direction == "up" else "упала"
+        try:
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=(
+                    f"🔔 АЛЕРТ • {symbol}\n"
+                    f"Цена {movement} на {change_24h_pct:+.2f}% за 24 часа.\n"
+                    f"Текущая цена: {format_price(last_price)} USDT.\n"
+                    f"Ваш порог: ±{threshold:g}%.\n"
+                    "Это уведомление о движении рынка, не торговая рекомендация."
+                ),
+            )
+        except TelegramError:
+            LOG.exception("Failed to send price alert for %s to chat %s", symbol, chat_id)
+        else:
+            store.set_watch_alert_direction(chat_id, symbol, next_state)
+
+
+async def get_market_symbols(
+    bot_data: dict,
+    config: Config,
+    client: BybitClient,
+) -> tuple[str, ...]:
+    active_symbols = bot_data.get("active_symbols")
+    refreshed_at = bot_data.get("symbols_refreshed_at", 0.0)
+    if not active_symbols or time.monotonic() - refreshed_at >= SYMBOL_CACHE_SECONDS:
+        active_symbols = await client.get_top_usdt_perpetual_symbols_by_turnover(
+            LIQUID_MARKET_LIMIT
+        )
+        bot_data["active_symbols"] = active_symbols
+        bot_data["symbols_refreshed_at"] = time.monotonic()
+        LOG.info("Loaded %d liquid USDT perpetual symbols from Bybit", len(active_symbols))
+    if not config.all_usdt_perpetuals:
+        active_set = set(active_symbols)
+        return tuple(symbol for symbol in config.symbols if symbol in active_set)
+    return active_symbols
+
+
+def subscription_batches(topics: list[str]) -> list[list[str]]:
+    batches: list[list[str]] = []
+    current: list[str] = []
+    current_length = 0
+    for topic in topics:
+        topic_length = len(topic) + 3
+        if topic_length > MAX_SUBSCRIPTION_ARGUMENT_CHARS:
+            raise ValueError(f"WebSocket topic is too long: {topic}")
+        if current and current_length + topic_length > MAX_SUBSCRIPTION_ARGUMENT_CHARS:
+            batches.append(current)
+            current = []
+            current_length = 0
+        current.append(topic)
+        current_length += topic_length
+    if current:
+        batches.append(current)
+    return batches
+
+
+async def seed_interval_history(
+    application: Application,
+    interval: str,
+    symbols: tuple[str, ...],
+) -> None:
+    config: Config = application.bot_data["config"]
+    client: BybitClient = application.bot_data["bybit"]
+    cache_by_interval = application.bot_data.setdefault("candle_cache", {})
+    candles_by_symbol = cache_by_interval.setdefault(interval, {})
+    period = max(
+        config.slow_ema_period,
+        config.rsi_period + 1,
+        config.atr_period + 1,
+        config.volume_lookback + 1,
+        201 if interval == config.ema_pullback_interval else 0,
+    )
+    if interval == config.trend_interval:
+        period = max(period, config.trend_ema_period + 1)
+    limit = min(1000, max(200, period + 2))
+    semaphore = asyncio.Semaphore(MAX_CONCURRENT_SYMBOL_SCANS)
+    completed = 0
+
+    async def seed_symbol(symbol: str) -> None:
+        nonlocal completed
+        if symbol in candles_by_symbol:
+            return
+        try:
+            async with semaphore:
+                candles = await client.get_closed_candles(symbol, interval, limit=limit)
+            if candles:
+                candles_by_symbol[symbol] = candles
+            else:
+                LOG.warning("No initial %s candles available for %s", interval, symbol)
+        except (httpx.HTTPError, RuntimeError, ValueError):
+            LOG.exception("Failed to load initial %s candles for %s", interval, symbol)
+        finally:
+            completed += 1
+            if completed % 100 == 0 or completed == len(symbols):
+                LOG.info("Initialized %s candle history for %d/%d markets", interval, completed, len(symbols))
+
+    await asyncio.gather(*(seed_symbol(symbol) for symbol in symbols))
+
+
+def parse_confirmed_candle(payload: dict) -> tuple[str, Candle] | None:
+    topic = payload.get("topic")
+    data = payload.get("data")
+    if not isinstance(topic, str) or not isinstance(data, list):
+        return None
+    topic_parts = topic.split(".", 2)
+    if len(topic_parts) != 3 or topic_parts[0] != "kline":
+        return None
+    if not data or not isinstance(data[0], dict) or data[0].get("confirm") is not True:
+        return None
+
+    candle_data = data[0]
+    try:
+        candle = Candle(
+            timestamp=int(candle_data["start"]),
+            open=float(candle_data["open"]),
+            high=float(candle_data["high"]),
+            low=float(candle_data["low"]),
+            close=float(candle_data["close"]),
+            volume=float(candle_data["volume"]),
+        )
+    except (KeyError, TypeError, ValueError) as error:
+        raise RuntimeError(f"Malformed Bybit WebSocket kline: {topic}") from error
+    return topic_parts[2], candle
+
+
+async def handle_closed_candle(application: Application, interval: str, symbol: str, candle: Candle) -> None:
+    config: Config = application.bot_data["config"]
+    cache_by_interval = application.bot_data.setdefault("candle_cache", {})
+    candles_by_symbol = cache_by_interval.setdefault(interval, {})
+    candles = candles_by_symbol.setdefault(symbol, [])
+    if candles and candle.timestamp < candles[-1].timestamp:
+        return
+    if candles and candle.timestamp == candles[-1].timestamp:
+        candles[-1] = candle
+    else:
+        candles.append(candle)
+
+    interval_lookback_24h = max(
+        1, round(24 * 60 / interval_minutes(interval))
+    )
+    keep_count = max(
+        config.slow_ema_period,
+        config.trend_ema_period if interval == config.trend_interval else 0,
+        201 if interval == config.ema_pullback_interval else 0,
+        config.rsi_period + 1,
+        config.atr_period + 1,
+        config.volume_lookback + 1,
+        SIGNAL_CHART_CANDLES,
+        interval_lookback_24h + 1,
+    ) + 5
+    if len(candles) > keep_count:
+        del candles[:-keep_count]
+    application.bot_data["last_market_event_at"] = datetime.now(MOSCOW_TIMEZONE).strftime(
+        "%Y-%m-%d %H:%M:%S МСК"
+    )
+
+    if interval != config.ema_pullback_interval:
+        return
+
+    store: SignalStore = application.bot_data["store"]
+    subscribers = store.subscribers()
+    last_pullback_processed = store.last_strategy_processed(
+        EMA_PULLBACK_STRATEGY_NAME, symbol, interval
+    )
+    if last_pullback_processed is not None and candle.timestamp <= last_pullback_processed:
+        return
+
+    signal = build_ema_pullback_signal(
+        symbol,
+        candles,
+        atr_period=config.atr_period,
+        atr_multiplier=config.atr_multiplier,
+        take_profit_1_r=config.take_profit_1_r,
+        take_profit_2_r=config.take_profit_2_r,
+        rsi_period=config.rsi_period,
+        volume_multiplier=config.volume_multiplier,
+        volume_lookback=config.volume_lookback,
+    )
+    if signal and subscribers:
+        message = format_signal(signal, config, candles, interval=interval)
+        enqueue_market_alert(
+            application,
+            subscribers,
+            message,
+            candles,
+            symbol,
+            interval,
+            signal,
+        )
+    store.mark_strategy_processed(
+        EMA_PULLBACK_STRATEGY_NAME, symbol, interval, candle.timestamp
+    )
+
+
+async def stream_interval(
+    application: Application,
+    interval: str,
+    symbols: tuple[str, ...],
+    refresh_at: float,
+) -> None:
+    topics = [f"kline.{interval}.{symbol}" for symbol in symbols]
+    batches = subscription_batches(topics)
+    backoff = 2
+    while time.monotonic() < refresh_at:
+        try:
+            async with websockets.connect(
+                BYBIT_LINEAR_WS_URL,
+                ping_interval=20,
+                ping_timeout=20,
+                max_size=4 * 1024 * 1024,
+                close_timeout=5,
+            ) as websocket:
+                for batch in batches:
+                    await websocket.send(json.dumps({"op": "subscribe", "args": batch}))
+                    await asyncio.sleep(0.1)
+                application.bot_data["market_stream_status"] = "connected"
+                LOG.info("Subscribed to %d Bybit %s candle topics", len(topics), interval)
+                backoff = 2
+
+                while time.monotonic() < refresh_at:
+                    try:
+                        raw_message = await asyncio.wait_for(websocket.recv(), timeout=20)
+                    except asyncio.TimeoutError:
+                        await websocket.send(json.dumps({"op": "ping"}))
+                        continue
+
+                    message = json.loads(raw_message)
+                    if not isinstance(message, dict):
+                        continue
+                    if message.get("success") is False:
+                        raise RuntimeError(
+                            f"Bybit WebSocket subscription failed: {message.get('ret_msg')}"
+                        )
+                    confirmed = parse_confirmed_candle(message)
+                    if confirmed:
+                        symbol, candle = confirmed
+                        await handle_closed_candle(application, interval, symbol, candle)
+        except (
+            OSError,
+            asyncio.TimeoutError,
+            json.JSONDecodeError,
+            RuntimeError,
+            WebSocketException,
+        ):
+            application.bot_data["market_stream_status"] = "reconnecting"
+            LOG.exception("Bybit %s candle stream disconnected; reconnecting", interval)
+            await asyncio.sleep(min(backoff, max(0, refresh_at - time.monotonic())))
+            backoff = min(backoff * 2, 30)
+
+
+async def run_market_streams(application: Application) -> None:
+    config: Config = application.bot_data["config"]
+    client: BybitClient = application.bot_data["bybit"]
+    intervals = (config.ema_pullback_interval,)
+
+    while True:
+        application.bot_data["market_stream_status"] = "initializing"
+        try:
+            symbols = await get_market_symbols(application.bot_data, config, client)
+            for interval in intervals:
+                await seed_interval_history(application, interval, symbols)
+        except (httpx.HTTPError, RuntimeError, ValueError, KeyError):
+            application.bot_data["market_stream_status"] = "reconnecting"
+            LOG.exception("Unable to initialize Bybit market streams")
+            await asyncio.sleep(10)
+            continue
+
+        application.bot_data["market_stream_status"] = "connecting"
+        LOG.info(
+            "Starting real-time Bybit candle feeds for %d markets at intervals %s",
+            len(symbols),
+            intervals,
+        )
+        refresh_at = time.monotonic() + WS_SYMBOL_REFRESH_SECONDS
+        await asyncio.gather(
+            *(
+                stream_interval(application, interval, symbols, refresh_at)
+                for interval in intervals
+            )
+        )
+
+
+async def post_init(application: Application) -> None:
+    application.job_queue.scheduler.timezone = MOSCOW_TIMEZONE
+    application.bot_data["http_client"] = httpx.AsyncClient(
+        timeout=BYBIT_HTTP_TIMEOUT_SECONDS
+    )
+    application.bot_data["bybit"] = BybitClient(application.bot_data["http_client"])
+    application.bot_data["pending_alerts"] = []
+    application.bot_data["queued_alert_keys"] = set()
+    application.bot_data["signal_queue_event"] = asyncio.Event()
+    application.create_task(
+        run_signal_dispatcher(application),
+        name="signal-alert-dispatcher",
+    )
+    application.create_task(
+        run_market_streams(application),
+        name="bybit-market-streams",
+    )
+    application.job_queue.run_repeating(
+        check_price_alerts,
+        interval=PRICE_ALERT_SCAN_SECONDS,
+        first=10,
+        name="watchlist-price-alerts",
+        job_kwargs={"max_instances": 1, "coalesce": True},
+    )
+
+
+async def post_shutdown(application: Application) -> None:
+    http_client: httpx.AsyncClient = application.bot_data["http_client"]
+    await http_client.aclose()
+    store: SignalStore = application.bot_data["store"]
+    store.close()
+
+
+def main() -> None:
+    logging.basicConfig(
+        level=os.environ.get("LOG_LEVEL", "INFO").upper(),
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    config = Config.from_env()
+    store = SignalStore(config.database_path)
+    application = (
+        ApplicationBuilder()
+        .token(config.telegram_bot_token)
+        .post_init(post_init)
+        .post_shutdown(post_shutdown)
+        .build()
+    )
+    application.bot_data["config"] = config
+    application.bot_data["store"] = store
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("stop", stop))
+    application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(CommandHandler("status", status))
+    application.add_handler(CommandHandler("symbols", symbols))
+    application.add_handler(CommandHandler("watch", watch))
+    application.add_handler(CommandHandler("unwatch", unwatch))
+    application.add_handler(CommandHandler("watchlist", watchlist_command))
+    markets = "all active USDT perpetuals" if config.all_usdt_perpetuals else config.symbols
+    LOG.info("Starting signal-only bot for %s at interval %s", markets, config.interval)
+    application.run_polling()
+
+
+if __name__ == "__main__":
+    main()
