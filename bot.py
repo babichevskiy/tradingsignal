@@ -25,7 +25,17 @@ from telegram import InputFile, Update
 from telegram.error import TelegramError
 from telegram.ext import Application, ApplicationBuilder, CommandHandler, ContextTypes
 
-from strategy import Candle, Signal, build_signal, confirm_trend, detect_rsi_extreme, ema, rsi
+from strategy import (
+    Candle,
+    EMA_PULLBACK_STRATEGY_NAME,
+    Signal,
+    build_ema_pullback_signal,
+    build_signal,
+    confirm_trend,
+    detect_rsi_extreme,
+    ema,
+    rsi,
+)
 
 BYBIT_KLINE_URL = "https://api.bybit.com/v5/market/kline"
 BYBIT_INSTRUMENTS_URL = "https://api.bybit.com/v5/market/instruments-info"
@@ -68,6 +78,7 @@ class Config:
     volume_lookback: int
     trend_interval: str
     trend_ema_period: int
+    ema_pullback_interval: str
 
     @classmethod
     def from_env(cls) -> Config:
@@ -105,6 +116,9 @@ class Config:
             volume_lookback = int(os.environ.get("VOLUME_LOOKBACK", "20"))
             trend_interval = os.environ.get("TREND_INTERVAL", "60").strip().upper()
             trend_ema_period = int(os.environ.get("TREND_EMA_PERIOD", "200"))
+            ema_pullback_interval = os.environ.get(
+                "EMA_PULLBACK_INTERVAL", "240"
+            ).strip().upper()
         except ValueError as error:
             raise ValueError("Strategy periods and multipliers must be numeric") from error
         if fast_ema < 2 or slow_ema <= fast_ema or slow_ema > 198:
@@ -115,6 +129,8 @@ class Config:
             raise ValueError("RSI_PERIOD must be at least 2 and ATR_PERIOD must be positive")
         if trend_interval not in VALID_INTERVALS:
             raise ValueError(f"TREND_INTERVAL must be one of: {', '.join(sorted(VALID_INTERVALS))}")
+        if ema_pullback_interval not in {"60", "240"}:
+            raise ValueError("EMA_PULLBACK_INTERVAL must be 60 or 240")
         if not 2 <= trend_ema_period <= 500:
             raise ValueError("TREND_EMA_PERIOD must be between 2 and 500")
         if volume_lookback < 1 or not math.isfinite(volume_multiplier) or volume_multiplier <= 0:
@@ -144,6 +160,7 @@ class Config:
             volume_lookback=volume_lookback,
             trend_interval=trend_interval,
             trend_ema_period=trend_ema_period,
+            ema_pullback_interval=ema_pullback_interval,
         )
 
 
@@ -158,7 +175,7 @@ class PendingMarketAlert:
     priority: float
     queued_at: float
     expires_at: float
-    dedup_key: tuple[str, str, str, int]
+    dedup_key: tuple[str, str, str, int, str]
 
 
 class SignalStore:
@@ -175,6 +192,13 @@ class SignalStore:
                 interval TEXT NOT NULL,
                 timestamp INTEGER NOT NULL,
                 PRIMARY KEY (symbol, interval)
+            );
+            CREATE TABLE IF NOT EXISTS processed_strategy_candles (
+                strategy TEXT NOT NULL,
+                symbol TEXT NOT NULL,
+                interval TEXT NOT NULL,
+                timestamp INTEGER NOT NULL,
+                PRIMARY KEY (strategy, symbol, interval)
             );
             CREATE TABLE IF NOT EXISTS processed_rsi_extremes (
                 symbol TEXT NOT NULL,
@@ -222,6 +246,31 @@ class SignalStore:
             ON CONFLICT(symbol, interval) DO UPDATE SET timestamp = excluded.timestamp
             """,
             (symbol, interval, timestamp),
+        )
+        self.connection.commit()
+
+    def last_strategy_processed(
+        self, strategy: str, symbol: str, interval: str
+    ) -> int | None:
+        row = self.connection.execute(
+            """
+            SELECT timestamp FROM processed_strategy_candles
+            WHERE strategy = ? AND symbol = ? AND interval = ?
+            """,
+            (strategy, symbol, interval),
+        ).fetchone()
+        return row[0] if row else None
+
+    def mark_strategy_processed(
+        self, strategy: str, symbol: str, interval: str, timestamp: int
+    ) -> None:
+        self.connection.execute(
+            """
+            INSERT INTO processed_strategy_candles(strategy, symbol, interval, timestamp)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(strategy, symbol, interval) DO UPDATE SET timestamp = excluded.timestamp
+            """,
+            (strategy, symbol, interval, timestamp),
         )
         self.connection.commit()
 
@@ -514,14 +563,40 @@ class BybitClient:
         return payload
 
 
+def format_interval_label(interval: str) -> str:
+    return {
+        "60": "1ч",
+        "120": "2ч",
+        "240": "4ч",
+        "D": "1д",
+        "W": "1н",
+        "M": "1м",
+    }.get(interval, f"{interval}м")
+
+
 def format_signal(
-    signal: Signal, config: Config, candles: list[Candle] | None = None
+    signal: Signal,
+    config: Config,
+    candles: list[Candle] | None = None,
+    interval: str | None = None,
 ) -> str:
     direction_emoji = "🟢" if signal.direction == "LONG" else "🔴"
     opened_at = datetime.fromtimestamp(signal.timestamp / 1000, tz=MOSCOW_TIMEZONE)
-    interval_label = {"D": "1д", "W": "1н", "M": "1м"}.get(config.interval, f"{config.interval}м")
+    signal_interval = interval or config.interval
+    interval_label = format_interval_label(signal_interval)
+    strategy_details = (
+        "Тренд: цена и EMA20/50/200 выстроены по направлению сделки; "
+        "откат к EMA20/50 подтвержден поглощением или пин-баром."
+        if signal.strategy == EMA_PULLBACK_STRATEGY_NAME
+        else (
+            f"EMA {config.fast_ema_period}/{config.slow_ema_period} + RSI {config.rsi_period}; "
+            f"подтверждены EMA {config.trend_ema_period} на {config.trend_interval} "
+            f"и объемом ≥{config.volume_multiplier:g}x среднего."
+        )
+    )
     message = (
         f"🚨 СИГНАЛ • {signal.direction} {direction_emoji}\n"
+        f"🏷 Стратегия: {signal.strategy}\n"
         f"#{signal.symbol} · Bybit Perpetual · {interval_label}\n"
         f"Время свечи: {opened_at:%Y-%m-%d %H:%M} МСК\n\n"
         f"💰 Вход: {format_price(signal.entry)}\n"
@@ -531,14 +606,12 @@ def format_signal(
         f"({price_change(signal.entry, signal.take_profit_2, signal.direction):+.2f}%)\n"
         f"🛑 Стоп: {format_price(signal.stop_loss)} "
         f"({price_change(signal.entry, signal.stop_loss, signal.direction):+.2f}%)\n\n"
-        f"EMA {config.fast_ema_period}/{config.slow_ema_period} + RSI {config.rsi_period}; "
-        f"подтверждены EMA {config.trend_ema_period} на {config.trend_interval} и объемом "
-        f"≥{config.volume_multiplier:g}x среднего. Уровни рассчитаны по ATR {config.atr_period}.\n"
+        f"{strategy_details} Уровни рассчитаны по ATR {config.atr_period}.\n"
         "Только аналитическая информация: бот не торгует и не является финансовой рекомендацией."
     )
     if candles:
         message += "\n\n" + format_market_analysis(
-            calculate_market_analysis(candles, config.interval, config.rsi_period)
+            calculate_market_analysis(candles, signal_interval, config.rsi_period)
         )
     return message
 
@@ -797,8 +870,16 @@ def enqueue_market_alert(
         return
     kind = "signal" if signal else "rsi"
     timestamp = signal.timestamp if signal else candles[-1].timestamp
-    dedup_key = (kind, symbol, interval, timestamp)
-    queued_keys: set[tuple[str, str, str, int]] = application.bot_data["queued_alert_keys"]
+    dedup_key = (
+        kind,
+        symbol,
+        interval,
+        timestamp,
+        signal.strategy if signal else "",
+    )
+    queued_keys: set[tuple[str, str, str, int, str]] = application.bot_data[
+        "queued_alert_keys"
+    ]
     if dedup_key in queued_keys:
         return
 
@@ -835,7 +916,9 @@ def enqueue_market_alert(
 
 async def run_signal_dispatcher(application: Application) -> None:
     pending: list[PendingMarketAlert] = application.bot_data["pending_alerts"]
-    queued_keys: set[tuple[str, str, str, int]] = application.bot_data["queued_alert_keys"]
+    queued_keys: set[tuple[str, str, str, int, str]] = application.bot_data[
+        "queued_alert_keys"
+    ]
     queue_event: asyncio.Event = application.bot_data["signal_queue_event"]
     loop = asyncio.get_running_loop()
     next_send_at = loop.time()
@@ -912,7 +995,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     store.subscribe(update.effective_chat.id)
     await update.message.reply_text(
         "Подписка включена. Я отслеживаю публичные свечи Bybit и отправляю технические сигналы "
-        "по одному, не чаще одного раза в 3 минуты.\n"
+        "по одному, не чаще одного раза в 3 минуты. Метка EMA PULLBACK обозначает отдельную "
+        "стратегию отката на старшем таймфрейме.\n"
         "Команды: /status, /symbols, /watch, /watchlist, /unwatch, /stop, /help."
     )
 
@@ -932,7 +1016,9 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             "с подтверждением RSI. Также сообщаю о входе RSI в зоны перекупленности (≥70) "
             "и перепроданности (≤30); это предупреждение о возможном откате/отскоке, "
             "не гарантия разворота. Сигналы на вход дополнительно фильтруются EMA тренда "
-            "и повышенным объемом.\n"
+            "и повышенным объемом. Отдельно работает EMA PULLBACK 20/50/200: направление "
+            "по выстроенным EMA, вход после отката и подтверждающей свечи (поглощение/пин-бар) "
+            f"на {format_interval_label(context.application.bot_data['config'].ema_pullback_interval)}.\n"
             "Я не принимаю ордера и не использую ключи биржи.\n\n"
             "/start — подписаться\n/status — состояние бота\n/symbols — список рынков\n"
             "/watch BTCUSDT [5] — следить за монетой и задать порог изменения за 24 часа в %\n"
@@ -961,6 +1047,8 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"Режим: сигналы без торговли\n"
         f"Рынки: {markets}\n"
         f"Таймфрейм: {config.interval}\n"
+        f"Дополнительная стратегия: EMA PULLBACK 20/50/200 на "
+        f"{format_interval_label(config.ema_pullback_interval)}\n"
         f"Стратегия: EMA {config.fast_ema_period}/{config.slow_ema_period}, "
         f"RSI {config.rsi_period} (перегрев ≥70 / ≤30), "
         f"ATR {config.atr_period} x{config.atr_multiplier:g}\n"
@@ -1200,6 +1288,7 @@ async def seed_interval_history(
         config.rsi_period + 1,
         config.atr_period + 1,
         config.volume_lookback + 1,
+        201 if interval == config.ema_pullback_interval else 0,
     )
     if interval == config.trend_interval:
         period = max(period, config.trend_ema_period + 1)
@@ -1272,6 +1361,7 @@ async def handle_closed_candle(application: Application, interval: str, symbol: 
     keep_count = max(
         config.slow_ema_period,
         config.trend_ema_period if interval == config.trend_interval else 0,
+        201 if interval == config.ema_pullback_interval else 0,
         config.rsi_period + 1,
         config.atr_period + 1,
         config.volume_lookback + 1,
@@ -1284,11 +1374,44 @@ async def handle_closed_candle(application: Application, interval: str, symbol: 
         "%Y-%m-%d %H:%M:%S МСК"
     )
 
-    if interval != config.interval:
+    if interval not in {config.interval, config.ema_pullback_interval}:
         return
 
     store: SignalStore = application.bot_data["store"]
     subscribers = store.subscribers()
+    if interval == config.ema_pullback_interval:
+        last_pullback_processed = store.last_strategy_processed(
+            EMA_PULLBACK_STRATEGY_NAME, symbol, interval
+        )
+        if last_pullback_processed is None or candle.timestamp > last_pullback_processed:
+            signal = build_ema_pullback_signal(
+                symbol,
+                candles,
+                atr_period=config.atr_period,
+                atr_multiplier=config.atr_multiplier,
+                take_profit_1_r=config.take_profit_1_r,
+                take_profit_2_r=config.take_profit_2_r,
+            )
+            if signal and subscribers:
+                message = format_signal(
+                    signal, config, candles, interval=interval
+                )
+                enqueue_market_alert(
+                    application,
+                    subscribers,
+                    message,
+                    candles,
+                    symbol,
+                    interval,
+                    signal,
+                )
+            store.mark_strategy_processed(
+                EMA_PULLBACK_STRATEGY_NAME, symbol, interval, candle.timestamp
+            )
+
+    if interval != config.interval:
+        return
+
     analysis = calculate_market_analysis(candles, interval, config.rsi_period)
     latest_rsi_state = detect_rsi_extreme(
         [item.close for item in candles], config.rsi_period
@@ -1425,7 +1548,11 @@ async def stream_interval(
 async def run_market_streams(application: Application) -> None:
     config: Config = application.bot_data["config"]
     client: BybitClient = application.bot_data["bybit"]
-    intervals = tuple(dict.fromkeys((config.interval, config.trend_interval)))
+    intervals = tuple(
+        dict.fromkeys(
+            (config.interval, config.trend_interval, config.ema_pullback_interval)
+        )
+    )
 
     while True:
         application.bot_data["market_stream_status"] = "initializing"

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+EMA_PULLBACK_STRATEGY_NAME = "EMA PULLBACK 20/50/200"
+
 
 @dataclass(frozen=True)
 class Candle:
@@ -22,6 +24,7 @@ class Signal:
     take_profit_2: float
     stop_loss: float
     timestamp: int
+    strategy: str = "EMA 20/50 crossover"
 
 
 def ema(values: list[float], period: int) -> list[float]:
@@ -99,6 +102,110 @@ def confirm_ema_ribbon(signal: Signal, candles: list[Candle]) -> bool:
     if signal.direction == "SHORT":
         return levels[0] < levels[1] < levels[2] < levels[3] and closes[-1] < levels[0]
     return False
+
+
+def build_ema_pullback_signal(
+    symbol: str,
+    candles: list[Candle],
+    atr_period: int = 14,
+    atr_multiplier: float = 1.5,
+    take_profit_1_r: float = 1,
+    take_profit_2_r: float = 2,
+    pullback_lookback: int = 3,
+) -> Signal | None:
+    if pullback_lookback < 1:
+        raise ValueError("pullback_lookback must be positive")
+    if len(candles) < 201 + pullback_lookback:
+        return None
+
+    closes = [candle.close for candle in candles]
+    lines = {period: ema(closes, period) for period in (20, 50, 200)}
+    volatility = atr(candles, atr_period)
+    if any(not values for values in lines.values()) or not volatility:
+        return None
+
+    current_ema20 = lines[20][-1]
+    current_ema50 = lines[50][-1]
+    current_ema200 = lines[200][-1]
+    current = candles[-1]
+    if current.close <= 0:
+        return None
+
+    if current.close > current_ema200 and current_ema20 > current_ema50 > current_ema200:
+        direction = "LONG"
+    elif current.close < current_ema200 and current_ema20 < current_ema50 < current_ema200:
+        direction = "SHORT"
+    else:
+        return None
+
+    touched_levels = []
+    for index in range(len(candles) - pullback_lookback - 1, len(candles) - 1):
+        candle = candles[index]
+        for period in (20, 50):
+            level = lines[period][index - (period - 1)]
+            if candle.low <= level <= candle.high:
+                touched_levels.append(level)
+    if not touched_levels:
+        return None
+
+    previous = candles[-2]
+    body = abs(current.close - current.open)
+    upper_wick = current.high - max(current.open, current.close)
+    lower_wick = min(current.open, current.close) - current.low
+    candle_range = current.high - current.low
+    bullish_engulfing = (
+        previous.close < previous.open
+        and current.close > current.open
+        and current.open <= previous.close
+        and current.close >= previous.open
+    )
+    bearish_engulfing = (
+        previous.close > previous.open
+        and current.close < current.open
+        and current.open >= previous.close
+        and current.close <= previous.open
+    )
+    bullish_pin_bar = (
+        body > 0
+        and candle_range > 0
+        and lower_wick >= 2 * body
+        and lower_wick >= 2 * upper_wick
+        and (current.close - current.low) / candle_range >= 2 / 3
+    )
+    bearish_pin_bar = (
+        body > 0
+        and candle_range > 0
+        and upper_wick >= 2 * body
+        and upper_wick >= 2 * lower_wick
+        and (current.high - current.close) / candle_range >= 2 / 3
+    )
+    if direction == "LONG":
+        if not (bullish_engulfing or bullish_pin_bar) or not any(
+            current.close > level for level in touched_levels
+        ):
+            return None
+    elif not (bearish_engulfing or bearish_pin_bar) or not any(
+        current.close < level for level in touched_levels
+    ):
+        return None
+
+    current_atr = volatility[-1]
+    risk = atr_multiplier * current_atr
+    if current_atr <= 0 or risk >= current.close:
+        return None
+    if direction == "SHORT" and take_profit_2_r * risk >= current.close:
+        return None
+    sign = 1 if direction == "LONG" else -1
+    return Signal(
+        symbol=symbol,
+        direction=direction,
+        entry=current.close,
+        take_profit_1=current.close + sign * take_profit_1_r * risk,
+        take_profit_2=current.close + sign * take_profit_2_r * risk,
+        stop_loss=current.close - sign * risk,
+        timestamp=current.timestamp,
+        strategy=EMA_PULLBACK_STRATEGY_NAME,
+    )
 
 
 def build_ema_ribbon_pullback_signals(
@@ -272,6 +379,7 @@ def build_signal(
             take_profit_2=entry + take_profit_2_r * risk,
             stop_loss=entry - risk,
             timestamp=candles[-1].timestamp,
+            strategy=f"EMA {fast_period}/{slow_period} crossover",
         )
 
     if previous_fast >= previous_slow and current_fast < current_slow:
@@ -288,6 +396,7 @@ def build_signal(
             take_profit_2=entry - take_profit_2_r * risk,
             stop_loss=entry + risk,
             timestamp=candles[-1].timestamp,
+            strategy=f"EMA {fast_period}/{slow_period} crossover",
         )
 
     return None

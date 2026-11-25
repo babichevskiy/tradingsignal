@@ -3,8 +3,10 @@ from unittest.mock import patch
 
 from strategy import (
     Candle,
+    EMA_PULLBACK_STRATEGY_NAME,
     Signal,
     atr,
+    build_ema_pullback_signal,
     build_signal,
     build_ema_ribbon_pullback_signals,
     confirm_trend,
@@ -113,6 +115,106 @@ class SignalTests(unittest.TestCase):
             self.assertTrue(confirm_ema_ribbon(long_signal, candles))
         with patch("strategy.ema", side_effect=[[108] * 182, [109] * 152, [104] * 102, [102, 102]]):
             self.assertFalse(confirm_ema_ribbon(long_signal, candles))
+
+    def test_ema_pullback_detects_bullish_and_bearish_engulfing(self):
+        long_candles = [
+            Candle(index, 100, 101, 99, 100, 10) for index in range(204)
+        ]
+        long_candles[-2] = Candle(202, 106, 107, 104, 104.5, 10)
+        long_candles[-1] = Candle(203, 104, 108, 103, 107, 12)
+
+        short_candles = [
+            Candle(index, 100, 101, 99, 100, 10) for index in range(204)
+        ]
+        short_candles[-2] = Candle(202, 94, 98, 93, 96, 10)
+        short_candles[-1] = Candle(203, 96, 97, 92, 93, 12)
+
+        def bullish_emas(values, period):
+            return [{20: 105, 50: 103, 200: 100}[period]] * (
+                len(values) - period + 1
+            )
+
+        def bearish_emas(values, period):
+            return [{20: 95, 50: 97, 200: 100}[period]] * (
+                len(values) - period + 1
+            )
+
+        with (
+            patch("strategy.ema", side_effect=bullish_emas),
+            patch("strategy.atr", return_value=[1] * (len(long_candles) - 14)),
+        ):
+            long_signal = build_ema_pullback_signal("TESTUSDT", long_candles)
+        with (
+            patch("strategy.ema", side_effect=bearish_emas),
+            patch("strategy.atr", return_value=[1] * (len(short_candles) - 14)),
+        ):
+            short_signal = build_ema_pullback_signal("TESTUSDT", short_candles)
+
+        self.assertIsNotNone(long_signal)
+        self.assertEqual(long_signal.direction, "LONG")
+        self.assertEqual(long_signal.strategy, EMA_PULLBACK_STRATEGY_NAME)
+        self.assertEqual(long_signal.take_profit_1, 108.5)
+        self.assertEqual(long_signal.stop_loss, 105.5)
+        self.assertIsNotNone(short_signal)
+        self.assertEqual(short_signal.direction, "SHORT")
+        self.assertEqual(short_signal.take_profit_1, 91.5)
+        self.assertEqual(short_signal.stop_loss, 94.5)
+
+    def test_ema_pullback_accepts_rejection_pin_bars(self):
+        long_candles = [
+            Candle(index, 100, 101, 99, 100, 10) for index in range(204)
+        ]
+        long_candles[-2] = Candle(202, 105, 106, 104, 105.5, 10)
+        long_candles[-1] = Candle(203, 104, 106.5, 100, 106, 12)
+        short_candles = [
+            Candle(index, 100, 101, 99, 100, 10) for index in range(204)
+        ]
+        short_candles[-2] = Candle(202, 95, 96, 94, 94.5, 10)
+        short_candles[-1] = Candle(203, 96, 100, 93.5, 94, 12)
+
+        def bullish_emas(values, period):
+            return [{20: 105, 50: 103, 200: 100}[period]] * (
+                len(values) - period + 1
+            )
+
+        def bearish_emas(values, period):
+            return [{20: 95, 50: 97, 200: 100}[period]] * (
+                len(values) - period + 1
+            )
+
+        with (
+            patch("strategy.ema", side_effect=bullish_emas),
+            patch("strategy.atr", return_value=[1] * (len(long_candles) - 14)),
+        ):
+            long_signal = build_ema_pullback_signal("TESTUSDT", long_candles)
+        with (
+            patch("strategy.ema", side_effect=bearish_emas),
+            patch("strategy.atr", return_value=[1] * (len(short_candles) - 14)),
+        ):
+            short_signal = build_ema_pullback_signal("TESTUSDT", short_candles)
+
+        self.assertEqual(long_signal.direction, "LONG")
+        self.assertEqual(short_signal.direction, "SHORT")
+
+    def test_ema_pullback_rejects_an_unordered_ema_trend(self):
+        candles = [
+            Candle(index, 100, 101, 99, 100, 10) for index in range(204)
+        ]
+        candles[-2] = Candle(202, 106, 107, 104, 104.5, 10)
+        candles[-1] = Candle(203, 104, 108, 103, 107, 12)
+
+        def unordered_emas(values, period):
+            return [{20: 103, 50: 105, 200: 100}[period]] * (
+                len(values) - period + 1
+            )
+
+        with (
+            patch("strategy.ema", side_effect=unordered_emas),
+            patch("strategy.atr", return_value=[1] * (len(candles) - 14)),
+        ):
+            signal = build_ema_pullback_signal("TESTUSDT", candles)
+
+        self.assertIsNone(signal)
 
     def test_ema_ribbon_pullback_generates_signal_after_reclaim_with_volume(self):
         candles = [Candle(index, 100, 101, 99, 100, 10) for index in range(201)]

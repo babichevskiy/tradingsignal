@@ -26,7 +26,7 @@ from bot import (
     run_signal_dispatcher,
     subscription_batches,
 )
-from strategy import Candle, Signal
+from strategy import Candle, EMA_PULLBACK_STRATEGY_NAME, Signal
 
 
 class ConfigTests(unittest.TestCase):
@@ -37,6 +37,7 @@ class ConfigTests(unittest.TestCase):
         self.assertTrue(config.all_usdt_perpetuals)
         self.assertEqual(config.symbols, ())
         self.assertEqual(config.interval, "15")
+        self.assertEqual(config.ema_pullback_interval, "240")
         self.assertEqual((config.fast_ema_period, config.slow_ema_period), (20, 50))
         self.assertEqual((config.trend_interval, config.trend_ema_period), ("60", 200))
         self.assertEqual((config.volume_multiplier, config.volume_lookback), (1.2, 20))
@@ -51,6 +52,22 @@ class ConfigTests(unittest.TestCase):
 
         self.assertFalse(config.all_usdt_perpetuals)
         self.assertEqual(config.symbols, ("BTCUSDT", "ETHUSDT"))
+
+    def test_pullback_interval_can_be_set_to_one_hour_or_four_hours_only(self):
+        for interval in ("60", "240"):
+            with patch.dict(
+                os.environ,
+                {"TELEGRAM_BOT_TOKEN": "test-token", "EMA_PULLBACK_INTERVAL": interval},
+                clear=True,
+            ):
+                self.assertEqual(Config.from_env().ema_pullback_interval, interval)
+        with patch.dict(
+            os.environ,
+            {"TELEGRAM_BOT_TOKEN": "test-token", "EMA_PULLBACK_INTERVAL": "15"},
+            clear=True,
+        ):
+            with self.assertRaisesRegex(ValueError, "EMA_PULLBACK_INTERVAL"):
+                Config.from_env()
 
     def test_invalid_ema_order_is_rejected(self):
         with patch.dict(
@@ -88,6 +105,23 @@ class ConfigTests(unittest.TestCase):
         self.assertIn("изменение за 24ч", message)
         self.assertIn("RSI", message)
         self.assertIn("MA50", message)
+
+    def test_pullback_signal_message_is_tagged_and_uses_its_own_interval(self):
+        with patch.dict(os.environ, {"TELEGRAM_BOT_TOKEN": "test-token"}, clear=True):
+            config = Config.from_env()
+        candles = [
+            Candle(index * 14_400_000, 100, 102, 99, 101, 10)
+            for index in range(100)
+        ]
+        signal = Signal(
+            "BTCUSDT", "LONG", 101, 104, 107, 98, candles[-1].timestamp,
+            strategy=EMA_PULLBACK_STRATEGY_NAME,
+        )
+
+        message = format_signal(signal, config, candles, interval="240")
+
+        self.assertIn(f"Стратегия: {EMA_PULLBACK_STRATEGY_NAME}", message)
+        self.assertIn("4ч", message)
 
     def test_market_analysis_reports_change_rsi_and_distance_from_ma50(self):
         candles = [
@@ -170,6 +204,42 @@ class ConfigTests(unittest.TestCase):
 
 
 class SignalQueueTests(unittest.TestCase):
+    def test_queue_keeps_distinct_strategies_for_same_symbol_and_candle(self):
+        with patch.dict(os.environ, {"TELEGRAM_BOT_TOKEN": "test-token"}, clear=True):
+            config = Config.from_env()
+        application = SimpleNamespace(
+            bot_data={
+                "config": config,
+                "pending_alerts": [],
+                "queued_alert_keys": set(),
+            }
+        )
+        candles = [
+            Candle(index, 100, 101, 99, 100, 10)
+            for index in range(config.volume_lookback + 1)
+        ]
+        crossover_signal = Signal("BTCUSDT", "LONG", 100, 103, 106, 97, 20)
+        pullback_signal = Signal(
+            "BTCUSDT", "LONG", 100, 103, 106, 97, 20,
+            strategy=EMA_PULLBACK_STRATEGY_NAME,
+        )
+
+        async def enqueue_both():
+            application.bot_data["signal_queue_event"] = asyncio.Event()
+            enqueue_market_alert(
+                application, [123], "crossover", candles, "BTCUSDT", "240",
+                crossover_signal,
+            )
+            enqueue_market_alert(
+                application, [123], "pullback", candles, "BTCUSDT", "240",
+                pullback_signal,
+            )
+
+        asyncio.run(enqueue_both())
+
+        self.assertEqual(len(application.bot_data["pending_alerts"]), 2)
+        self.assertEqual(len(application.bot_data["queued_alert_keys"]), 2)
+
     def test_dispatcher_skips_alerts_after_unsubscribe(self):
         with patch.dict(os.environ, {"TELEGRAM_BOT_TOKEN": "test-token"}, clear=True):
             config = Config.from_env()
@@ -235,7 +305,7 @@ class SignalQueueTests(unittest.TestCase):
         low_priority_signal = Signal("BTCUSDT", "LONG", 100, 103, 106, 97, 20)
         high_priority_signal = Signal("ETHUSDT", "LONG", 100, 103, 106, 97, 20)
         delivered = []
-        stale_key = ("signal", "OLDUSDT", "15", 1)
+        stale_key = ("signal", "OLDUSDT", "15", 1, "EMA 20/50 crossover")
 
         async def record_delivery(*args):
             delivered.append((args[4], asyncio.get_running_loop().time()))
@@ -459,6 +529,52 @@ class BybitClientTests(unittest.TestCase):
         self.assertEqual(asyncio.run(process_twice()), 1)
         self.assertEqual(store.last_processed("BTCUSDT", "15"), 60)
         self.assertTrue(application.bot_data["last_market_event_at"].endswith("МСК"))
+        store.close()
+
+    def test_pullback_strategy_processes_each_closed_candle_once(self):
+        with patch.dict(os.environ, {"TELEGRAM_BOT_TOKEN": "test-token"}, clear=True):
+            config = Config.from_env()
+        store = SignalStore(":memory:")
+        store.subscribe(123)
+        history = [
+            Candle(index * 14_400_000, 100, 101, 99, 100, 10)
+            for index in range(201)
+        ]
+        application = SimpleNamespace(
+            bot_data={
+                "config": config,
+                "store": store,
+                "candle_cache": {"240": {"BTCUSDT": history}},
+            },
+            bot=SimpleNamespace(),
+        )
+        candle = Candle(201 * 14_400_000, 100, 102, 99, 101, 12)
+        signal = Signal(
+            "BTCUSDT", "LONG", 101, 104, 107, 98, candle.timestamp,
+            strategy=EMA_PULLBACK_STRATEGY_NAME,
+        )
+
+        async def process_twice():
+            with (
+                patch("bot.build_ema_pullback_signal", return_value=signal) as build_mock,
+                patch("bot.enqueue_market_alert") as enqueue_mock,
+            ):
+                await handle_closed_candle(application, "240", "BTCUSDT", candle)
+                await handle_closed_candle(application, "240", "BTCUSDT", candle)
+                return build_mock, enqueue_mock
+
+        build_mock, enqueue_mock = asyncio.run(process_twice())
+
+        self.assertEqual(build_mock.call_count, 1)
+        self.assertEqual(enqueue_mock.call_count, 1)
+        self.assertEqual(enqueue_mock.call_args.args[5], "240")
+        self.assertIn(EMA_PULLBACK_STRATEGY_NAME, enqueue_mock.call_args.args[2])
+        self.assertEqual(
+            store.last_strategy_processed(
+                EMA_PULLBACK_STRATEGY_NAME, "BTCUSDT", "240"
+            ),
+            candle.timestamp,
+        )
         store.close()
 
     def test_historical_candles_are_fetched_with_window_and_volume(self):
