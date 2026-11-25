@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-EMA_PULLBACK_STRATEGY_NAME = "EMA PULLBACK 20/50/200"
+EMA_PULLBACK_STRATEGY_NAME = "EMA PULLBACK 20/50/200 CONFLUENCE"
 
 
 @dataclass(frozen=True)
@@ -112,6 +112,9 @@ def build_ema_pullback_signal(
     take_profit_1_r: float = 1,
     take_profit_2_r: float = 2,
     pullback_lookback: int = 3,
+    rsi_period: int = 14,
+    volume_multiplier: float = 1.2,
+    volume_lookback: int = 20,
 ) -> Signal | None:
     if pullback_lookback < 1:
         raise ValueError("pullback_lookback must be positive")
@@ -121,7 +124,13 @@ def build_ema_pullback_signal(
     closes = [candle.close for candle in candles]
     lines = {period: ema(closes, period) for period in (20, 50, 200)}
     volatility = atr(candles, atr_period)
-    if any(not values for values in lines.values()) or not volatility:
+    momentum = rsi(closes, rsi_period)
+    if (
+        any(not values for values in lines.values())
+        or not volatility
+        or not momentum
+        or len(candles) <= volume_lookback
+    ):
         return None
 
     current_ema20 = lines[20][-1]
@@ -136,6 +145,19 @@ def build_ema_pullback_signal(
     elif current.close < current_ema200 and current_ema20 < current_ema50 < current_ema200:
         direction = "SHORT"
     else:
+        return None
+
+    current_rsi = momentum[-1]
+    if direction == "LONG" and not 50 <= current_rsi <= 65:
+        return None
+    if direction == "SHORT" and not 35 <= current_rsi <= 50:
+        return None
+
+    average_volume = (
+        sum(candle.volume for candle in candles[-volume_lookback - 1 : -1])
+        / volume_lookback
+    )
+    if average_volume <= 0 or candles[-1].volume < average_volume * volume_multiplier:
         return None
 
     touched_levels = []

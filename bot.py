@@ -995,7 +995,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     store.subscribe(update.effective_chat.id)
     await update.message.reply_text(
         "Подписка включена. Я отслеживаю публичные свечи Bybit и отправляю технические сигналы "
-        "по одному, не чаще одного раза в 3 минуты. Метка EMA PULLBACK обозначает отдельную "
+        "по одному, не чаще одного раза в 3 минуты. Метка EMA PULLBACK CONFLUENCE обозначает отдельную "
         "стратегию отката на старшем таймфрейме.\n"
         "Команды: /status, /symbols, /watch, /watchlist, /unwatch, /stop, /help."
     )
@@ -1016,8 +1016,9 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             "с подтверждением RSI. Также сообщаю о входе RSI в зоны перекупленности (≥70) "
             "и перепроданности (≤30); это предупреждение о возможном откате/отскоке, "
             "не гарантия разворота. Сигналы на вход дополнительно фильтруются EMA тренда "
-            "и повышенным объемом. Отдельно работает EMA PULLBACK 20/50/200: направление "
-            "по выстроенным EMA, вход после отката и подтверждающей свечи (поглощение/пин-бар) "
+            "и повышенным объемом. Отдельно работает EMA PULLBACK 20/50/200 CONFLUENCE: направление "
+            "по выстроенным EMA, вход после отката и подтверждающей свечи (поглощение/пин-бар), "
+            "дополнительно подтвержденные RSI и объемом "
             f"на {format_interval_label(context.application.bot_data['config'].ema_pullback_interval)}.\n"
             "Я не принимаю ордера и не использую ключи биржи.\n\n"
             "/start — подписаться\n/status — состояние бота\n/symbols — список рынков\n"
@@ -1047,7 +1048,7 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"Режим: сигналы без торговли\n"
         f"Рынки: {markets}\n"
         f"Таймфрейм: {config.interval}\n"
-        f"Дополнительная стратегия: EMA PULLBACK 20/50/200 на "
+        f"Дополнительная стратегия: EMA PULLBACK 20/50/200 CONFLUENCE на "
         f"{format_interval_label(config.ema_pullback_interval)}\n"
         f"Стратегия: EMA {config.fast_ema_period}/{config.slow_ema_period}, "
         f"RSI {config.rsi_period} (перегрев ≥70 / ≤30), "
@@ -1391,6 +1392,9 @@ async def handle_closed_candle(application: Application, interval: str, symbol: 
                 atr_multiplier=config.atr_multiplier,
                 take_profit_1_r=config.take_profit_1_r,
                 take_profit_2_r=config.take_profit_2_r,
+                rsi_period=config.rsi_period,
+                volume_multiplier=config.volume_multiplier,
+                volume_lookback=config.volume_lookback,
             )
             if signal and subscribers:
                 message = format_signal(

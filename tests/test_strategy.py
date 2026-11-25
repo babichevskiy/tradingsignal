@@ -142,11 +142,13 @@ class SignalTests(unittest.TestCase):
         with (
             patch("strategy.ema", side_effect=bullish_emas),
             patch("strategy.atr", return_value=[1] * (len(long_candles) - 14)),
+            patch("strategy.rsi", return_value=[60] * (len(long_candles) - 14)),
         ):
             long_signal = build_ema_pullback_signal("TESTUSDT", long_candles)
         with (
             patch("strategy.ema", side_effect=bearish_emas),
             patch("strategy.atr", return_value=[1] * (len(short_candles) - 14)),
+            patch("strategy.rsi", return_value=[40] * (len(short_candles) - 14)),
         ):
             short_signal = build_ema_pullback_signal("TESTUSDT", short_candles)
 
@@ -185,11 +187,13 @@ class SignalTests(unittest.TestCase):
         with (
             patch("strategy.ema", side_effect=bullish_emas),
             patch("strategy.atr", return_value=[1] * (len(long_candles) - 14)),
+            patch("strategy.rsi", return_value=[60] * (len(long_candles) - 14)),
         ):
             long_signal = build_ema_pullback_signal("TESTUSDT", long_candles)
         with (
             patch("strategy.ema", side_effect=bearish_emas),
             patch("strategy.atr", return_value=[1] * (len(short_candles) - 14)),
+            patch("strategy.rsi", return_value=[40] * (len(short_candles) - 14)),
         ):
             short_signal = build_ema_pullback_signal("TESTUSDT", short_candles)
 
